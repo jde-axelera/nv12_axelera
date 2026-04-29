@@ -1,4 +1,4 @@
-# EVS YOLOv5s — NV12 Object Detection on Axelera Metis
+# YOLOv5s — NV12 Object Detection on Axelera Metis
 
 Real-time object detection pipeline that accepts raw NV12 camera frames (or
 JPEG/PNG via NV12 simulation), preprocesses them on the CPU, runs YOLOv5s on
@@ -61,7 +61,7 @@ wall time approaches the inference time alone.
 ## Download the model
 
 ```bash
-source /home/ubuntu/1.6/voyager-sdk/venv/bin/activate
+source $VOYAGER_SDK/venv/bin/activate
 axdownloadmodel --model yolov5s-v7-coco
 # model lands in:  build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json
 ```
@@ -71,9 +71,9 @@ axdownloadmodel --model yolov5s-v7-coco
 ## Build
 
 ```bash
-cd /home/ubuntu/1.6/voyager-sdk/customers/evs
+cd /path/to/nv12_axelera
 
-source ../../venv/bin/activate
+source $VOYAGER_SDK/venv/bin/activate
 export AXELERA_RUNTIME_DIR=$(python -c 'from axelera.runtime.configs import runtime_dir; print(runtime_dir)')
 
 PKG_CONFIG_PATH=$AXELERA_RUNTIME_DIR/lib/pkgconfig \
@@ -82,14 +82,14 @@ PKG_CONFIG_PATH=$AXELERA_RUNTIME_DIR/lib/pkgconfig \
 ninja -C build
 ```
 
-The binary is `build/evs_yolov5s`.
+The binary is `build/yolov5s_nv12`.
 
 ---
 
 ## Usage
 
 ```
-./build/evs_yolov5s  model.json  [image]  [labels.names]
+./build/yolov5s_nv12  model.json  [image]  [labels.names]
                      [--size=WxH]  [--output=path.jpg]
                      [--warmup=N]  [--runs=N]
 ```
@@ -113,10 +113,10 @@ The binary is `build/evs_yolov5s`.
 ```bash
 export LD_LIBRARY_PATH=/opt/axelera/runtime-1.6.0-1/lib:$LD_LIBRARY_PATH
 
-./build/evs_yolov5s \
-    /home/ubuntu/1.6/voyager-sdk/build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json \
+./build/yolov5s_nv12 \
+    $VOYAGER_SDK/build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json \
     input_images/dog_bike_768x576.nv12 \
-    /home/ubuntu/1.6/voyager-sdk/ax_datasets/labels/coco.names \
+    $VOYAGER_SDK/ax_datasets/labels/coco.names \
     --size=768x576 --warmup=5 --runs=30 \
     --output=output_images/dog_bike_result.jpg
 ```
@@ -126,10 +126,10 @@ Expected detections: **dog 89 %**, **bicycle 45 %**, **car 65 %**
 ### Tulips (QCIF 176 x 144 NV12)
 
 ```bash
-./build/evs_yolov5s \
-    /home/ubuntu/1.6/voyager-sdk/build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json \
+./build/yolov5s_nv12 \
+    $VOYAGER_SDK/build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json \
     input_images/tulips_nv12_prog_qcif.yuv \
-    /home/ubuntu/1.6/voyager-sdk/ax_datasets/labels/coco.names \
+    $VOYAGER_SDK/ax_datasets/labels/coco.names \
     --size=176x144 --warmup=5 --runs=30 \
     --output=output_images/tulips_result.jpg
 ```
@@ -180,7 +180,7 @@ throughput.
 ## Source layout
 
 ```
-customers/evs/
+/
 ├── CMakeLists.txt
 ├── README.md
 ├── include/

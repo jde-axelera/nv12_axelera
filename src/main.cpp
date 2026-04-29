@@ -1,6 +1,6 @@
-// EVS — YOLOv5s object detection with NV12 input and DMA-BUF passthrough
+// YOLOv5s object detection with NV12 input and DMA-BUF passthrough
 // Targets the Axelera Metis device via axruntime.
-// Copyright EVS / Axelera AI, 2026
+// Copyright Axelera AI, 2026
 
 #include <array>
 #include <cstdint>

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.12)
-project(evs_yolov5s LANGUAGES C CXX VERSION 1.0)
+project(yolov5s_nv12 LANGUAGES C CXX VERSION 1.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
