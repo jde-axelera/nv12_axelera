@@ -89,13 +89,13 @@ static void print_latency_table(
     const SectionTimer& t_dec,
     const SectionTimer& t_resnet,
     const SectionTimer& t_wall,
-    int runs, bool use_dmabuf, int resnet_cores)
+    int runs, bool use_dmabuf, int yolo_cores, int resnet_cores)
 {
     std::printf("\n+----------------------------------------------------------------------+\n");
     std::printf("| LATENCY BREAKDOWN  (%d runs, %s, YOLOv5s+ResNet50 cascade)\n",
                 runs, use_dmabuf ? "DMA-BUF" : "host-mem");
-    std::printf("| YOLOv5s: 2 AIPU cores (v2)    ResNet50: %d AIPU core(s) (v%d)\n",
-                resnet_cores, resnet_cores);
+    std::printf("| YOLOv5s: %d AIPU core(s) (v%d)    ResNet50: %d AIPU core(s) (v%d)\n",
+                yolo_cores, yolo_cores, resnet_cores, resnet_cores);
     std::printf("+------------------+----------+----------+----------+----------+\n");
     std::printf("| %-16s | %8s | %8s | %8s | %8s |\n",
                 "Section", "avg ms", "min ms", "max ms", "p95 ms");
@@ -414,7 +414,7 @@ int main(int argc, char** argv)
     }
 
     print_latency_table(t_pre, t_yolo, t_dec, t_resnet, t_wall,
-                        bench, use_dmabuf, resnet_cores);
+                        bench, use_dmabuf, yolo_cores, resnet_cores);
 
     // ── Final pass: annotate image and print embeddings ───────────────────────
     preprocess_yolo(yolo_ptrs[0]);
