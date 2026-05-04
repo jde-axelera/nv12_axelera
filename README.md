@@ -1,47 +1,222 @@
-# YOLOv5s — NV12 Object Detection on Axelera Metis
+# YOLOv5s — NV12 / RGBA Object Detection on Axelera Metis
 
-Real-time object detection pipeline that accepts raw NV12 camera frames (or
-JPEG/PNG via NV12 simulation), preprocesses them on the CPU, runs YOLOv5s on
-the Axelera Metis AIPU, decodes the three detection heads, applies NMS, and
-saves an annotated JPEG.  Per-section latency breakdown is printed after each
-benchmark run.
+Real-time YOLOv5s object detection pipeline for the Axelera Metis AIPU.
+Three entry points cover different camera integration scenarios — raw NV12
+from a standard camera, raw RGBA from an FPGA/ISP, and a full FPGA DMA
+simulation with physical-address-aware double-buffering.
 
 ---
 
-## Pipeline
+## Pipeline overview
 
 ```
-Camera / File
-    |
-    v
-NV12 Buffer (raw YUV420 semi-planar)
-    |
-    +-------[Thread: preprocess next frame into buf[nxt]]
-    |                                                    |
-    v  [Preprocess — CPU, buf[cur]]                      | (overlaps)
-    |   cvtColor NV12→BGR, resize letterbox,             |
-    |   quantise → int8 NHWC                             |
-    v                                                    |
-DMA-BUF Input Tensor  (zero-copy to AIPU)                |
-    |                                                    |
-    v  [Inference — AIPU, buf[cur]] (~6 ms)              |
-    |   YOLOv5s int8 (post-sigmoid outputs on chip)      |
-    v                                                    |
-3 x Output Tensors  (host memory, int8)  <---------------+
-    |                   (thread done, buf[nxt] ready for next iter)
-    v  [Decode + NMS — CPU]
-    |   decode_head × 3 strides  →  candidate Det list
-    |   greedy per-class NMS (IoU 0.45)
-    v
-Annotated JPEG  (bounding boxes + labels)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 THREE SOURCE PATHS — converge at the AIPU                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  [1] yolov5s_nv12          [2] yolov5s_rgba          [3] yolov5s_rgba_fpga
+  ──────────────────        ─────────────────          ─────────────────────
+  .nv12 / .yuv file         .rgba file                 /dev/dma_heap/system
+         │                        │                           │
+         │ fread                  │ fread               DMA_HEAP_IOCTL_ALLOC
+         ▼                        ▼                           ▼
+  ┌─────────────┐          ┌─────────────┐          ┌───────────────────────┐
+  │ NV12 bytes  │          │ RGBA bytes  │          │  rgba_dma[0]  (1.7 MB)│
+  │ heap vector │          │ heap vector │          │  rgba_dma[1]  (1.7 MB)│
+  └──────┬──────┘          └──────┬──────┘          └──────────┬────────────┘
+         │                        │                            │
+         │                        │                   virt_to_phys()
+         │                        │                   → phys_addr[0/1]
+         │                        │                   → fpga_set_dma_target()
+         │                        │                            │
+         │                        │                     ┌──────┴──────┐
+         │                        │                     │ FPGA DMA    │
+         │                        │                     │ engine      │
+         │                        │                     │ writes RGBA │
+         │                        │                     └──────┬──────┘
+         │                        │                            │ (hardware,
+         │                        │                            │  concurrent
+         │                        │                            │  with AIPU)
+         │                        │                            ▼
+         │                        │                   rgba_dma[nxt].ptr
+         │                        │                   (CPU reads via mmap)
+         │                        │                            │
+         │ nv12_to_tensor()       │ rgba_to_tensor()           │ rgba_to_tensor()
+         │  cvtColor NV12→BGR     │  R,G,B direct              │  R,G,B direct
+         │  (OpenCV)              │  (no cvtColor)             │  (no cvtColor)
+         │  resize → uH×uW        │  resize → uH×uW            │  resize → uH×uW
+         │  scale/zp → int8       │  scale/zp → int8           │  scale/zp → int8
+         │  pad to [644,656,4]    │  pad to [644,656,4]        │  pad to [644,656,4]
+         └────────────────────────┴────────────────────────────┘
+                                          │
+                                          ▼
+                               ┌──────────────────────┐
+                               │     in_dma[b]         │  ← DMA-BUF (1.6 MB)
+                               │  int8  NHWC tensor    │
+                               │  shape [1,644,656,4]  │
+                               │  .fd → axruntime      │
+                               └──────────┬────────────┘
+                                          │  input_dmabuf=1  (zero-copy)
+                                          ▼
+                               ┌──────────────────────┐
+                               │   Axelera Metis AIPU  │
+                               │   YOLOv5s-v7-coco     │
+                               │   int8, sigmoid fused │
+                               └──────────┬────────────┘
+                                          │  3 × MMIO outputs (host memory)
+                              ┌───────────┼───────────┐
+                              ▼           ▼           ▼
+                        [1,80,80,256] [1,40,40,256] [1,20,20,256]
+                         stride 8      stride 16     stride 32
+                              │           │           │
+                              └───────────┴───────────┘
+                                          │
+                                          │  decode_head() × 3
+                                          │   dequantise int8 → float
+                                          │   apply anchors → [x,y,w,h]
+                                          │   conf filter (0.25)
+                                          ▼
+                                  greedy per-class NMS
+                                  IoU threshold 0.45
+                                          │
+                                          ▼
+                            Detections  [x1,y1,x2,y2,conf,cls]
+                                          │
+                                          ▼
+                                  save_annotated()
+                                  annotated output JPEG
 ```
 
-The benchmark uses a **double-buffer pipeline**: two DMA-BUF input allocations
-(`buf[0]` and `buf[1]`) alternate each frame.  A `std::async` thread preprocesses
-frame N+1 into `buf[nxt]` while the AIPU runs frame N on `buf[cur]`.  Because
-preprocess (~2 ms) completes well before inference (~6 ms), the CPU thread is
-already done by the time the main thread calls `future.get()` — so the per-frame
-wall time approaches the inference time alone.
+---
+
+## Double-buffer timing
+
+Both the preprocess step and AIPU inference run every frame. The pipeline
+overlaps them by using two input buffer slots (`buf[0]` / `buf[1]`):
+
+```
+  i = 0          i = 1          i = 2          i = 3
+  cur=0, nxt=1   cur=1, nxt=0   cur=0, nxt=1   cur=1, nxt=0
+  ─────────────────────────────────────────────────────────────────
+  Async thread   │ pre(buf[1])│ pre(buf[0])│ pre(buf[1])│ ...
+  (CPU)          └────────────┘└────────────┘└────────────┘
+  ─────────────────────────────────────────────────────────────────
+  Main thread    │  inf(buf[0])│  inf(buf[1])│  inf(buf[0])│ ...
+  (AIPU)         └─────────────┘└─────────────┘└─────────────┘
+  ─────────────────────────────────────────────────────────────────
+  Wall time per  │◄── ~6.9 ms ─►│
+  frame                  ↑
+                  max(pre, inf)   ← preprocess (~6 ms) hidden
+                                    behind inference (~6.5 ms)
+
+  Sequential (no overlap):  pre + inf + dec  ≈ 12.8 ms  →  ~78 FPS
+  Pipelined (double-buffer): max(pre, inf)   ≈  6.9 ms  → ~145 FPS
+```
+
+The async lambda returns `{dma_ms, pre_ms}` via `std::future`; `future.get()`
+is called after `axr_run_model_instance` returns, so it never stalls the main
+thread in steady state.
+
+---
+
+## FPGA DMA buffer chain (yolov5s_rgba_fpga)
+
+```
+  STARTUP — allocate and expose physical addresses
+  ─────────────────────────────────────────────────────────────────────────
+  /dev/dma_heap/system
+       │
+       │ DMA_HEAP_IOCTL_ALLOC × 4   (2 RGBA source + 2 tensor)
+       │
+  ┌────┴──────────────────────────────────────────────────────────────────┐
+  │  rgba_dma[0]  W×H×4 B   .ptr = 0x7f…  .fd   ← FPGA writes here     │
+  │  rgba_dma[1]  W×H×4 B   .ptr = 0x7f…  .fd   ← FPGA writes here     │
+  │                                                                       │
+  │  in_dma[0]    644×656×4 B  .ptr  .fd         ← axruntime reads this │
+  │  in_dma[1]    644×656×4 B  .ptr  .fd         ← axruntime reads this │
+  └───────────────────────────────────────────────────────────────────────┘
+       │
+       │ virt_to_phys(rgba_dma[b].ptr)  → phys_addr[b]
+       │   reads /proc/self/pagemap  (needs root / CAP_SYS_ADMIN)
+       │
+       ▼
+  fpga_set_dma_target(slot=0, phys=0x…, stride=W×4)   ← one-time ioctl
+  fpga_set_dma_target(slot=1, phys=0x…, stride=W×4)
+
+  PER FRAME — double-buffered, cur = i&1, nxt = cur^1
+  ─────────────────────────────────────────────────────────────────────────
+
+   ┌─ Async thread (CPU) ─────────────────────────────┐
+   │                                                   │
+   │  ① fpga_trigger_frame(nxt)    ← non-blocking     │
+   │     fpga_wait_frame_done(nxt) ← blocks on IRQ    │
+   │     (simulated: memcpy into rgba_dma[nxt].ptr)   │
+   │                                                   │
+   │  ② rgba_to_tensor(                               │
+   │        rgba_dma[nxt].ptr,  ← reads DMA-BUF       │
+   │        W, H,                                      │
+   │        in_dma[nxt].ptr,    ← writes tensor        │
+   │        in_info[0])                                │
+   └──────────────────────────────┬────────────────────┘
+                                  │  runs concurrently ↕
+   ┌─ Main thread (AIPU) ─────────┴────────────────────┐
+   │                                                   │
+   │  axr_run_model_instance(                          │
+   │      in_args[cur],   ← in_dma[cur].fd             │
+   │      out_args)       ← host memory                │
+   │                                                   │
+   └───────────────────────────────────────────────────┘
+
+   future.get()  →  decode + NMS  →  next iteration
+```
+
+---
+
+## Measured latency
+
+All three pipelines, 30-run benchmark, Axelera Metis, SDK 1.6, 768×576 source:
+
+```
+  [1] yolov5s_nv12  (NV12 source, DMA-BUF tensor, double-buffered)
+
+  +------------------+----------+----------+----------+----------+
+  | Section          |   avg ms |   min ms |   max ms |   p95 ms |
+  +------------------+----------+----------+----------+----------+
+  | Preprocess NV12  |    5.372 |    3.127 |    7.276 |    7.196 |
+  | Inference (AIPU) |    6.691 |    6.111 |    7.883 |    7.462 |
+  | Decode + NMS     |    0.140 |    0.080 |    0.227 |    0.195 |
+  | Frame wall time  |    6.931 |    6.221 |    8.098 |    7.695 |
+  +------------------+----------+----------+----------+----------+
+  | Throughput:  144.3 FPS   Sequential: 12.2 ms
+
+  [2] yolov5s_rgba  (RGBA file source, same tensor path)
+
+  +------------------+----------+----------+----------+----------+
+  | Section          |   avg ms |   min ms |   max ms |   p95 ms |
+  +------------------+----------+----------+----------+----------+
+  | Preprocess RGBA  |    5.962 |    4.024 |    6.559 |    6.548 |
+  | Inference (AIPU) |    6.699 |    6.306 |    7.096 |    6.980 |
+  | Decode + NMS     |    0.163 |    0.099 |    0.193 |    0.191 |
+  | Frame wall time  |    6.935 |    6.641 |    7.331 |    7.202 |
+  +------------------+----------+----------+----------+----------+
+  | Throughput:  144.2 FPS   Sequential: 12.8 ms
+
+  [3] yolov5s_rgba_fpga  (FPGA DMA simulation, DMA-BUF source + tensor)
+
+  +------------------+----------+----------+----------+----------+
+  | Section          |   avg ms |   min ms |   max ms |   p95 ms |
+  +------------------+----------+----------+----------+----------+
+  | FPGA DMA sim     |    0.207 |    0.133 |    0.253 |    0.249 |  ← → ~0 ms real
+  | Preprocess RGBA  |    5.915 |    3.474 |    6.886 |    6.682 |
+  | Inference (AIPU) |    6.514 |    6.109 |    6.955 |    6.945 |
+  | Decode + NMS     |    0.153 |    0.072 |    0.213 |    0.200 |
+  | Frame wall time  |    6.892 |    6.262 |    7.557 |    7.296 |
+  +------------------+----------+----------+----------+----------+
+  | Throughput:  145.1 FPS   Async thread: 6.1 ms (hidden behind AIPU)
+```
+
+The **FPGA DMA sim** row (0.2 ms memcpy) collapses to ~0 ms when a real FPGA
+DMA engine writes the frame concurrently with the previous inference.
 
 ---
 
@@ -63,7 +238,7 @@ wall time approaches the inference time alone.
 ```bash
 source $VOYAGER_SDK/venv/bin/activate
 axdownloadmodel --model yolov5s-v7-coco
-# model lands in:  build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json
+# lands in: build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json
 ```
 
 ---
@@ -71,10 +246,9 @@ axdownloadmodel --model yolov5s-v7-coco
 ## Build
 
 ```bash
-cd /path/to/nv12_axelera
-
 source $VOYAGER_SDK/venv/bin/activate
-export AXELERA_RUNTIME_DIR=$(python -c 'from axelera.runtime.configs import runtime_dir; print(runtime_dir)')
+export AXELERA_RUNTIME_DIR=$(python -c \
+  'from axelera.runtime.configs import runtime_dir; print(runtime_dir)')
 
 PKG_CONFIG_PATH=$AXELERA_RUNTIME_DIR/lib/pkgconfig \
     cmake -Bbuild -GNinja . -DCMAKE_BUILD_TYPE=Release
@@ -82,175 +256,167 @@ PKG_CONFIG_PATH=$AXELERA_RUNTIME_DIR/lib/pkgconfig \
 ninja -C build
 ```
 
-The binary is `build/yolov5s_nv12`.
+Produces three binaries in `build/`:
+
+| Binary | Source | Description |
+|---|---|---|
+| `yolov5s_nv12` | `src/main.cpp` | NV12 / YUV semi-planar input |
+| `yolov5s_rgba` | `src/main_rgba.cpp` | Raw RGBA (4 B/px) input |
+| `yolov5s_rgba_fpga` | `src/main_rgba_fpga.cpp` | RGBA with FPGA DMA simulation |
 
 ---
 
 ## Usage
 
+All three binaries share the same CLI:
+
 ```
-./build/yolov5s_nv12  model.json  [image]  [labels.names]
-                     [--size=WxH]  [--output=path.jpg]
-                     [--warmup=N]  [--runs=N]
+./build/<binary>  model.json  [image]  [labels.names]
+                  [--size=WxH]  [--output=path.jpg]
+                  [--warmup=N]  [--runs=N]
 ```
 
-| Flag | Default | Description |
-|---|---|---|
-| `model.json` | required | Axelera model descriptor |
-| `image` | synthetic grey | JPEG / PNG **or** raw `.nv12` / `.yuv` |
-| `labels.names` | (no labels) | One class name per line (COCO: 80 lines) |
-| `--size=WxH` | 1920x1080 or filename-parsed | NV12/YUV frame dimensions |
-| `--output=path` | `<image>_detections.jpg` | Output JPEG path |
-| `--warmup=N` | 5 | Warmup iterations (not timed) |
-| `--runs=N` | 20 | Benchmark iterations |
+| Argument | Description |
+|---|---|
+| `model.json` | Axelera model descriptor (required) |
+| `image` | `yolov5s_nv12`: `.nv12` / `.yuv` or JPEG/PNG |
+| | `yolov5s_rgba` / `yolov5s_rgba_fpga`: `.rgba` or JPEG/PNG |
+| `labels.names` | One class name per line |
+| `--size=WxH` | Raw frame dimensions (default 1920×1080) |
+| `--output=path` | Output JPEG (default `<image>_detections.jpg`) |
+| `--warmup=N` | Warmup iterations, default 5 |
+| `--runs=N` | Benchmark iterations, default 20 |
 
 ---
 
 ## Example commands
 
-### Dog + bicycle (768 x 576 NV12)
-
 ```bash
 export LD_LIBRARY_PATH=/opt/axelera/runtime-1.6.0-1/lib:$LD_LIBRARY_PATH
-
-./build/yolov5s_nv12 \
-    $VOYAGER_SDK/build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json \
-    input_images/dog_bike_768x576.nv12 \
-    $VOYAGER_SDK/ax_datasets/labels/coco.names \
-    --size=768x576 --warmup=5 --runs=30 \
-    --output=output_images/dog_bike_result.jpg
+MODEL=/home/ubuntu/1.6/voyager-sdk/build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json
+LABELS=/home/ubuntu/1.6/voyager-sdk/ax_datasets/labels/coco.names
 ```
 
-Expected detections: **dog 89 %**, **bicycle 45 %**, **car 65 %**
-
-### Tulips (QCIF 176 x 144 NV12)
+### NV12 source
 
 ```bash
-./build/yolov5s_nv12 \
-    $VOYAGER_SDK/build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json \
-    input_images/tulips_nv12_prog_qcif.yuv \
-    $VOYAGER_SDK/ax_datasets/labels/coco.names \
-    --size=176x144 --warmup=5 --runs=30 \
-    --output=output_images/tulips_result.jpg
+./build/yolov5s_nv12 $MODEL input_images/dog_bike_768x576.nv12 $LABELS \
+    --size=768x576 --warmup=5 --runs=30 --output=output_images/nv12_result.jpg
 ```
 
-Expected detection: **vase 38 %**
+### RGBA source (file)
+
+```bash
+./build/yolov5s_rgba $MODEL input_images/dog_bike_768x576.rgba $LABELS \
+    --size=768x576 --warmup=5 --runs=30 --output=output_images/rgba_result.jpg
+```
+
+### RGBA source with FPGA DMA simulation
+
+```bash
+# Run as root to print physical DMA addresses for the FPGA driver:
+sudo ./build/yolov5s_rgba_fpga $MODEL input_images/dog_bike_768x576.rgba $LABELS \
+    --size=768x576 --warmup=5 --runs=30 --output=output_images/rgba_fpga_result.jpg
+```
+
+Expected detections (all three): **dog 88 %**, **car 65 %**, **bicycle 44 %**
 
 ---
 
-## Per-section latency table
+## FPGA integration guide
 
-After benchmarking the tool prints a breakdown of each pipeline stage.  The
-benchmark uses the double-buffer pipeline, so **Frame wall time** reflects the
-actual steady-state per-frame time (preprocess overlaps inference).
-**Sequential latency** is the sum of all stages as if run back-to-back and
-represents the minimum end-to-end latency for a single frame.
+`yolov5s_rgba_fpga` is structured so that replacing the simulation with a real
+FPGA driver is a two-line change inside the async lambda in `main_rgba_fpga.cpp`:
 
-```
-+--------------------------------------------------------------------+
-| LATENCY BREAKDOWN  (30 runs, DMA-BUF input, double-buffered pipeline)
-+------------------+----------+----------+----------+----------+
-| Section          |   avg ms |   min ms |   max ms |   p95 ms |
-+------------------+----------+----------+----------+----------+
-| Preprocess NV12  |    1.925 |    1.843 |    2.289 |    2.027 |
-| Inference (AIPU) |    6.072 |    5.651 |    6.423 |    6.360 |
-| Decode + NMS     |    0.060 |    0.055 |    0.076 |    0.074 |
-| Frame wall time  |    6.153 |    5.725 |    6.549 |    6.437 |
-+------------------+----------+----------+----------+----------+
-| Throughput (pipelined):  162.5 FPS
-| Sequential latency:      8.057 ms  (pre+inf+dec, non-overlapped)
-+--------------------------------------------------------------------+
+```cpp
+// Current (simulation — memcpy into DMA-BUF):
+const double dma_ms = sim.write_frame(nxt_rgba);
+
+// Production (real FPGA DMA engine):
+fpga_trigger_frame(nxt);           // tell FPGA: "fill slot nxt"
+fpga_wait_frame_done(nxt);         // block until DMA-complete IRQ fires
 ```
 
-Measured on dog_bike_768x576.nv12, Axelera Metis, SDK 1.6.
+Everything else — DMA-BUF allocation, physical address query, `rgba_to_tensor`,
+tensor buffers, axruntime — is production-ready as-is.
 
-### Why pipelined FPS > sequential FPS
+### Physical address flow
 
-| Mode | Formula | FPS |
-|---|---|---|
-| Sequential (old) | pre + inf + dec = 8.1 ms | ~124 FPS |
-| Pipelined (double-buffer) | max(pre, inf) + dec = 6.1 ms | ~163 FPS |
+```
+  sudo ./build/yolov5s_rgba_fpga ...
 
-The bottleneck is always the AIPU inference (~6 ms).  By hiding the 2 ms
-preprocess behind inference, the pipeline runs at close to bare-metal AIPU
-throughput.
+  [FPGA-SIM] Slot 0:  virt=0x7fd33c3da000  phys=0x1a3f4000
+  [FPGA-SIM]          → production: fpga_set_dma_target(slot=0, phys=0x1a3f4000, stride=3072)
+  [FPGA-SIM] Slot 1:  virt=0x7fd33c22a000  phys=0x1b5e0000
+  [FPGA-SIM]          → production: fpga_set_dma_target(slot=1, phys=0x1b5e0000, stride=3072)
+```
+
+The stride value (`W × 4` bytes) is the line pitch for the FPGA DMA descriptor.
+Physical addresses are stable for the process lifetime once the DMA-BUF pages
+are faulted in (done via `memset` before `virt_to_phys`).
+
+> **Note:** `/proc/self/pagemap` PFN access requires `CAP_SYS_ADMIN` on Linux
+> kernel ≥ 4.0. Run as root or grant the capability. The rest of the pipeline
+> runs without elevated privileges.
 
 ---
 
 ## Source layout
 
 ```
-/
+.
 ├── CMakeLists.txt
 ├── README.md
 ├── include/
-│   ├── annotate.hpp      — save_annotated(): draw boxes, save JPEG
-│   ├── dmabuf.hpp        — DmaBuf struct: alloc/release via /dev/dma_heap/system
-│   ├── preprocess.hpp    — nv12_to_tensor(): NV12 -> int8 NHWC tensor
-│   ├── timer.hpp         — SectionTimer + ScopeTimer RAII
-│   └── yolo_decode.hpp   — Det struct, decode_head(), nms()
+│   ├── annotate.hpp       save_annotated(): draw boxes, save JPEG
+│   ├── dmabuf.hpp         DmaBuf: alloc/release via /dev/dma_heap/system
+│   ├── preprocess.hpp     nv12_to_tensor(), rgba_to_tensor()
+│   ├── timer.hpp          SectionTimer + ScopeTimer RAII
+│   └── yolo_decode.hpp    Det struct, decode_head(), nms()
 ├── src/
-│   ├── main.cpp          — arg parsing, runtime setup, double-buffer pipeline, latency table
-│   ├── annotate.cpp
-│   ├── preprocess.cpp
-│   └── yolo_decode.cpp
+│   ├── main.cpp               NV12 pipeline  → yolov5s_nv12
+│   ├── main_rgba.cpp          RGBA pipeline  → yolov5s_rgba
+│   ├── main_rgba_fpga.cpp     FPGA DMA sim   → yolov5s_rgba_fpga
+│   ├── preprocess.cpp         nv12_to_tensor + rgba_to_tensor
+│   ├── yolo_decode.cpp        anchor decode + NMS
+│   └── annotate.cpp           bounding box drawing
 ├── input_images/
-│   ├── dog_bike_768x576.nv12
-│   └── tulips_nv12_prog_qcif.yuv
 └── output_images/
-    ├── dog_bike_result.jpg
-    └── tulips_result.jpg
 ```
 
 ---
 
 ## Implementation notes
 
-### Double-buffer DMA-BUF pipeline
-Two DMA-BUF allocations (`buf[0]`, `buf[1]`) are made at startup.  The
-benchmark loop alternates between them using `cur = i & 1` and `nxt = cur ^ 1`.
-A `std::async(std::launch::async, ...)` thread writes the preprocessed tensor
-into `buf[nxt]` while `axr_run_model_instance` blocks on `buf[cur]`.  The
-future's return value carries the thread's measured preprocess time.
+### Preprocessing: NV12 vs RGBA
 
-```cpp
-auto pre_fut = std::async(std::launch::async,
-    [src, w, h, nxt_ptr, &info]() -> double {
-        auto t0 = Clock::now();
-        nv12_to_tensor(src, w, h, nxt_ptr, info);
-        return Ms(Clock::now() - t0).count();
-    });
+`nv12_to_tensor` calls `cv::cvtColor(YUV2BGR_NV12)` then quantises. The colour
+conversion is the dominant cost (~2–3 ms at 768×576).
 
-{ ScopeTimer st(t_inf);
-  axr_run_model_instance(instance, in_args[cur].data(), ...); }
-
-t_pre.record(pre_fut.get());   // already done; no stall
-```
+`rgba_to_tensor` skips `cvtColor` entirely. RGBA pixels are `[R, G, B, A]`; the
+model expects `[R, G, B]` per channel, so `in_rgba[c]` for `c = 0,1,2` with a
+stride of 4 (skipping A) is sufficient. This eliminates the intermediate BGR
+buffer and the `cvtColor` call.
 
 ### DMA-BUF zero-copy input
-When `/dev/dma_heap/system` is available, the preprocessed input tensor is
-written directly into a DMA-BUF-backed allocation.  The AIPU reads it without
-any extra copy (`input_dmabuf=1`).  If the heap is unavailable the code falls
-back to host memory with a warning.
+
+`in_dma[b]` is allocated from `/dev/dma_heap/system`. The preprocessed int8
+tensor is written directly into its mmap'd pointer. axruntime receives the fd
+via `axrArgument.fd` (`input_dmabuf=1`), letting the AIPU DMA engine fetch it
+without a CPU copy.
 
 ### Why `output_dmabuf=0`
-Output tensors are MMIO-mapped registers on the Metis device.  The axruntime
-does not support DMA-BUF for MMIO outputs; attempting to set `output_dmabuf=1`
-returns an error at runtime.  Host memory pointers are used for all outputs.
+
+Metis outputs are MMIO-mapped registers, not DMA-capable memory. Setting
+`output_dmabuf=1` returns an error; all three output tensors use host memory.
 
 ### Post-sigmoid outputs
-YOLOv5s is compiled with the sigmoid activations fused into the AIPU graph.
-`decode_head` therefore dequantises the raw int8 values directly — **do not
-apply sigmoid again**.  Objectness and class scores are already in [0, 1]
-after dequantisation.
+
+Sigmoid is fused into the AIPU graph. `decode_head` dequantises the raw int8
+values directly — do not re-apply sigmoid. Objectness and class scores are
+already in [0, 1] after `value * scale + zero_point`.
 
 ### Coordinate space
-All bounding boxes produced by `decode_head` are in the model's 640 x 640
-input coordinate space.  `save_annotated` scales them back to the original
-image resolution before drawing.
 
-### NV12 format requirements
-The NV12 decoder (`cv::COLOR_YUV2BGR_NV12`) requires even width and height.
-If the source image has odd dimensions, `main.cpp` rounds up to the nearest
-even size before conversion.  The extra pixel column/row is filled by OpenCV
-and does not affect detection accuracy for typical images.
+`decode_head` outputs boxes in the model's 640×640 input space. `save_annotated`
+scales them back to the original image resolution before drawing.
