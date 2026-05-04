@@ -181,11 +181,18 @@ int main(int argc, char** argv)
         [](void*, axrLogLevel, const char* m){ fputs(m, stderr); fputc('\n', stderr); },
         nullptr);
 
-    auto* conn = axr_device_connect(ctx.get(), nullptr, 1, nullptr);
+    // Connect to enough sub-devices (cores) to fit both models simultaneously.
+    // Each model occupies its own core's L2 memory; sharing a single sub-device
+    // causes both models to compete for one core's 8 MB budget.
+    const int total_cores = yolo_cores + resnet_cores;
+    auto* conn = axr_device_connect(ctx.get(), nullptr,
+                                    static_cast<size_t>(total_cores), nullptr);
     if (!conn) {
         std::fprintf(stderr, "[ERROR] %s\n", axr_last_error_string(AXR_OBJECT(ctx.get())));
         return 1;
     }
+    std::printf("[INFO] Connected to %d AIPU sub-device(s) (YOLO:%d + ResNet50:%d)\n\n",
+                total_cores, yolo_cores, resnet_cores);
 
     // ── Load models ───────────────────────────────────────────────────────────
     // Open DMA heap first so we know whether to use DMA-BUF for YOLO
