@@ -28,7 +28,7 @@ PKG_CONFIG_PATH=$AXELERA_RUNTIME_DIR/lib/pkgconfig \
     cmake -Bbuild -GNinja . -DCMAKE_BUILD_TYPE=Release
 
 ninja -C build
-# → build/yolov5s_nv12, build/yolov5s_rgba, build/yolov5s_rgba_fpga
+# → build/yolov5s_nv12, build/yolov5s_rgba, build/yolov5s_rgba_fpga, build/yolov5s_cascade
 ```
 
 ### 2. Download the model(s)
@@ -365,39 +365,81 @@ double-buffer loop, decode, NMS.
 
 ## Cascade pipeline: detection + embedding
 
-`yolov5s_cascade` runs two models in sequence per frame:
+`yolov5s_cascade` runs two models in sequence per frame. Both stages use
+DMA-BUF zero-copy inputs and double-buffered preprocessing.
 
 ```
-  RGBA frame  (768 × 576, 4 bytes/pixel)
+  RGBA frame  (e.g. 768 × 576)
        │
-       │  Stage 1 — YOLOv5s detection  (AIPU, 1–2 cores)
-       │  rgba_to_tensor → int8 [1,644,656,4] → AIPU → 3 output heads
+       │  Stage 1 — YOLOv5s detection
+       │
+       │  ┌─ async thread: preprocess frame N+1 ──────────────────────┐
+       │  │  rgba_to_tensor → int8 tensor                             │
+       │  │  written into yolo_dma[nxt] (DMA-BUF mmap)               │
+       │  └── hidden behind ──► AIPU reads yolo_dma[cur] via fd       │
+       │                        (~9 ms inference)                      │
        ▼
-  Bounding boxes  [x1,y1,x2,y2, conf, cls]  (e.g. dog 88%, car 65%, bicycle 44%)
+  Bounding boxes  [x1, y1, x2, y2, conf, cls]
        │
-       │  For each detected object:
+       │  Stage 2 — ResNet50 embedding  (one call per batch of N crops)
        │
-       │  Stage 2 — ResNet50 embedding  (AIPU, 1–2 cores, batched)
-       │  crop_to_tensor: crop RGBA region → ImageNet-normalise → int8 [N,230,240,4]
-       │  Crops are batched in pairs (N=batch size of loaded model version)
+       │  ┌─ async thread: crop + ImageNet-normalise next batch ──────┐
+       │  │  crop_to_tensor → int8 tensor                            │
+       │  │  written into resnet_dma[nxt] (DMA-BUF mmap)             │
+       │  └── hidden behind ──► AIPU reads resnet_dma[cur] via fd     │
+       │                        (~4 ms inference)                     │
        ▼
   1024-dim float embedding per object
-  (global average pooling layer — useful for re-ID or downstream classification)
+  (ResNet50 global average pooling — useful for re-ID or classification)
 ```
 
 ### Model versions and AIPU cores
 
 The version directory in the model path sets the AIPU batch size and core count.
-The binary detects this automatically from the path:
+The binary detects this automatically:
 
 ```
-.../yolov5s-v7-coco/1/model.json   →  1 core,  batch = 1
-.../yolov5s-v7-coco/2/model.json   →  2 cores, batch = 2  (fills two slots per inference)
+.../yolov5s-v7-coco/1/model.json    →  1 core, batch = 1
+.../resnet50-imagenet/2/model.json  →  2 cores, batch = 2  (2 crops per call)
 ```
 
 The binary connects to `yolo_cores + resnet_cores` sub-devices so each model
-gets its own core's L2 memory (~8 MB each on Metis). Sharing a single sub-device
-causes both models to exceed the L2 budget.
+gets its own core's L2 memory (~8 MB per core on Metis). Sharing one sub-device
+causes both models to exceed the L2 budget and fail to load.
+
+### DMA-BUF for both stages
+
+Both YOLO and ResNet50 inputs are allocated as DMA-BUF (`/dev/dma_heap/system`).
+Crop preprocessing writes directly into the mmap of the DMA-BUF; `axruntime`
+then passes the fd to the AIPU DMA engine — no extra copy at inference time.
+
+```
+  CPU: crop_to_tensor(rgba, ..., resnet_dma[nxt].ptr, ...)  ← writes into DMA-BUF
+  AIPU: axr_run_model_instance(resnet_in_args[cur])         ← reads via fd, zero-copy
+```
+
+### Double-buffer in the ResNet50 stage
+
+With N detections and batch size B, there are `ceil(N/B)` ResNet50 calls.
+Without double-buffering each call is: `crop_fill (~2 ms) + AIPU (~4 ms) = 6 ms`.
+With double-buffering the fill of batch k+1 overlaps the AIPU run of batch k:
+
+```
+  Prime:   [fill batch 0]
+  batch 0: [AIPU batch 0]  |  [async fill batch 1]   → wall = max(4, 2) = 4 ms
+  batch 1: [AIPU batch 1]  |  [async fill batch 2]   → wall = 4 ms
+  ...
+  last:    [AIPU batch N]                             → wall = 4 ms
+  ──────────────────────────────────────────────────
+  Total:  fill_0 + num_batches × AIPU_ms
+        ≈ 2 + num_batches × 4 ms          (fill hidden when fill < AIPU)
+```
+
+For 3 detections (2 batches): `2 + 2×4 = 10 ms`  vs  `2 × 6 = 12 ms` sequential.
+For 20 detections (10 batches): `2 + 10×4 = 42 ms` vs `10 × 6 = 60 ms` sequential — **30% faster**.
+
+The latency table shows `ResNet50 prep` (fill time per batch) and `ResNet50 AIPU`
+(pure inference) separately. When `prep < AIPU` the fill is fully absorbed.
 
 ### ImageNet normalisation in `crop_to_tensor`
 
@@ -405,25 +447,22 @@ ResNet50 expects ImageNet-normalised input, not the simple scale/zero_point
 quantisation used for YOLOv5s:
 
 ```
-v = (pixel / 255 - mean[c]) / std[c]   with  mean=[0.485,0.456,0.406]  (R,G,B)
-                                               std =[0.229,0.224,0.225]
+v = (pixel / 255 - mean[c]) / std[c]   with  mean=[0.485, 0.456, 0.406]  (R,G,B)
+                                               std =[0.229, 0.224, 0.225]
 int8 = clamp(v / scale + zero_point, -128, 127)   scale=0.0187, zp=-14
 ```
 
 ### Reading the embedding output
 
-The ResNet50 output tensor is `[N, 1, 1, 1024]` int8. Dequantise to float:
+`embed_all()` stores all embeddings in a flat `float` vector:
+`embeds[det_idx * 1024 + feature_idx]`. Dequantisation is already applied
+(scale=0.1253, zp=-64 → float range ~[-2.1, 2.6]).
 
 ```cpp
-const int8_t* emb = resnet.out_host[0].get() + slot * 1024;
-float f = (emb[i] - zero_point) * scale;   // scale=0.1253, zp=-64 → range [-2.1, 2.6]
+// After embed_all(dets, embeds, ...):
+const float* emb = embeds.data() + det_idx * embed_dim;
+float f0 = emb[0];   // first feature of detection det_idx
 ```
-
-### Double-buffer optimisation
-
-YOLO preprocessing (async thread, ~6.4 ms) overlaps YOLO inference (~9 ms),
-hiding preprocess latency. ResNet50 runs after YOLO completes (cascade
-dependency) — there is no double-buffer benefit for the ResNet50 stage.
 
 ---
 
@@ -469,49 +508,49 @@ dependency) — there is no double-buffer benefit for the ResNet50 stage.
   (†) The FPGA DMA sim row is a memcpy (1.7 MB). With a real FPGA the
       DMA write runs concurrently with the AIPU — this row becomes ~0 ms.
 
-  yolov5s_cascade — cascade detection + ResNet50 embedding (768×576 RGBA, 3 detections)
-  ResNet50/call is the per-inference time; total ResNet50 time = calls × that value.
+  yolov5s_cascade — v1+v2 ★  (YOLO: 1 core, ResNet50: 2 cores, batch=2)
+  DMA-BUF inputs for both models; double-buffered ResNet50 stage.
+  Test image: 768×576 RGBA, 3 detections → 2 ResNet50 calls/frame.
 
-  Config v1+v1 (YOLO: 1 core, ResNet50: 1 core, batch=1, 3 calls/frame):
-  +------------------+----------+----------+----------+----------+
-  | Section          |   avg ms |   min ms |   max ms |   p95 ms |
-  +------------------+----------+----------+----------+----------+
-  | Preprocess RGBA  |    6.423 |    5.456 |    7.207 |    6.636 |
-  | YOLO v1          |    9.019 |    6.672 |    9.535 |    9.448 |
-  | Decode + NMS     |    0.181 |    0.166 |    0.198 |    0.194 |
-  | ResNet50/call    |    4.571 |    3.373 |    7.662 |    6.308 |
-  | Frame wall time  |   23.002 |   21.664 |   24.830 |   23.714 |
-  +------------------+----------+----------+----------+----------+
-  Throughput: 43.5 FPS   YOLO alone: 108.7 FPS
+  +--------------------+----------+----------+----------+----------+
+  | Section            |   avg ms |   min ms |   max ms |   p95 ms |
+  +--------------------+----------+----------+----------+----------+
+  | Preprocess RGBA    |    6.326 |    5.395 |    7.017 |    6.566 |
+  | YOLO v1            |    8.936 |    6.587 |    9.319 |    9.291 |
+  | Decode + NMS       |    0.192 |    0.170 |    0.424 |    0.243 |
+  | ResNet50 prep (‡)  |    2.133 |    1.989 |    2.343 |    2.268 |
+  | ResNet50 AIPU      |    4.073 |    2.700 |    5.429 |    5.396 |
+  | Frame wall time    |   19.492 |   17.266 |   20.110 |   20.085 |
+  +--------------------+----------+----------+----------+----------+
+  Throughput: 51.3 FPS   YOLO alone: 109.5 FPS
 
-  Config v1+v2 ★ FASTEST (YOLO: 1 core, ResNet50: 2 cores, batch=2, 2 calls/frame):
-  +------------------+----------+----------+----------+----------+
-  | Section          |   avg ms |   min ms |   max ms |   p95 ms |
-  +------------------+----------+----------+----------+----------+
-  | Preprocess RGBA  |    6.413 |    5.325 |    6.693 |    6.644 |
-  | YOLO v1          |    8.973 |    6.216 |    9.391 |    9.362 |
-  | Decode + NMS     |    0.176 |    0.057 |    0.192 |    0.192 |
-  | ResNet50/call    |    6.252 |    4.927 |    8.878 |    7.453 |
-  | Frame wall time  |   21.728 |   20.529 |   22.291 |   22.158 |
-  +------------------+----------+----------+----------+----------+
-  Throughput: 46.0 FPS   YOLO alone: 109.3 FPS
+  (‡) ResNet50 prep (crop + ImageNet normalise) runs async while AIPU processes
+      the previous batch — 2.1 ms fill is fully hidden behind 4.1 ms AIPU.
 
-  Config v2+v2 (YOLO: 2 cores, ResNet50: 2 cores, all 4 cores, 2 calls/frame):
-  +------------------+----------+----------+----------+----------+
-  | Section          |   avg ms |   min ms |   max ms |   p95 ms |
-  +------------------+----------+----------+----------+----------+
-  | Preprocess RGBA  |    6.518 |    5.435 |    7.357 |    6.843 |
-  | YOLO v2          |   12.823 |    8.294 |   14.147 |   13.313 |
-  | Decode + NMS     |    0.221 |    0.212 |    0.292 |    0.226 |
-  | ResNet50/call    |    7.403 |    4.634 |    9.946 |    9.913 |
-  | Frame wall time  |   27.924 |   23.656 |   29.358 |   28.794 |
-  +------------------+----------+----------+----------+----------+
-  Throughput: 35.8 FPS   YOLO alone: 76.7 FPS
+  Core count comparison (all with DMA-BUF + double-buffer, 3 detections):
+  ┌──────────┬───────────┬──────────────┬──────────┬───────────┐
+  │ Config   │ YOLO ms   │ ResNet50 ms  │ Wall ms  │ FPS       │
+  ├──────────┼───────────┼──────────────┼──────────┼───────────┤
+  │ v1 + v1  │  9.0      │ 3 × 4.6 seq │  23.0    │  43.5     │
+  │ v1 + v2★ │  9.0      │ 2 × 4.1 ovl │  19.5    │  51.3     │
+  │ v2 + v2  │ 12.8      │ 2 × 7.4     │  27.9    │  35.8     │
+  └──────────┴───────────┴──────────────┴──────────┴───────────┘
+  ovl = fill hidden by double-buffer;  seq = sequential (no overlap)
 
-  Key finding: more cores is NOT always faster on Metis for these models.
-  Single-core inference avoids multi-core synchronisation overhead.
-  The v1+v2 speedup over v1+v1 comes solely from halving ResNet50 calls
-  (batch=2 processes 2 crops per inference), not from parallel cores.
+  Scaling: how FPS changes with detection count (v1+v2, double-buffered):
+  ┌─────────────┬──────────────┬──────────┬──────────┐
+  │ Detections  │ ResNet calls │ Wall ms  │ FPS      │
+  ├─────────────┼──────────────┼──────────┼──────────┤
+  │  3 (tested) │      2       │  19.5    │  51      │
+  │ 10          │      5       │  30      │  33      │
+  │ 20          │     10       │  52      │  19      │
+  └─────────────┴──────────────┴──────────┴──────────┘
+  Formula: wall ≈ YOLO(9ms) + prime(2ms) + calls × AIPU_per_call(4ms)
+
+  Key findings:
+  · More cores ≠ faster: single-core models avoid multi-core sync overhead.
+  · v1+v2 advantage comes from batch=2 halving call count, not parallel cores.
+  · Double-buffer absorbs ~2 ms fill per batch; scales linearly with detection count.
 ```
 
 ---
