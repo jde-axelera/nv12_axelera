@@ -31,7 +31,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
 target_link_directories(${PROJECT_NAME} PUBLIC
     ${axruntime_LIBRARY_DIRS} ${opencv4_LIBRARY_DIRS})
 
-# ── RGBA pipeline (FPGA direct output) ───────────────────────────────────────
+# ── RGBA pipeline (FPGA direct output, file-based test) ──────────────────────
 add_executable(yolov5s_rgba src/main_rgba.cpp ${SHARED_SOURCES})
 target_compile_options(yolov5s_rgba PRIVATE ${COMPILE_FLAGS})
 target_include_directories(yolov5s_rgba PRIVATE
@@ -41,4 +41,14 @@ target_link_libraries(yolov5s_rgba PUBLIC
 target_link_directories(yolov5s_rgba PUBLIC
     ${axruntime_LIBRARY_DIRS} ${opencv4_LIBRARY_DIRS})
 
-install(TARGETS ${PROJECT_NAME} yolov5s_rgba RUNTIME DESTINATION bin)
+# ── RGBA pipeline with simulated FPGA DMA integration ────────────────────────
+add_executable(yolov5s_rgba_fpga src/main_rgba_fpga.cpp ${SHARED_SOURCES})
+target_compile_options(yolov5s_rgba_fpga PRIVATE ${COMPILE_FLAGS})
+target_include_directories(yolov5s_rgba_fpga PRIVATE
+    include ${axruntime_INCLUDE_DIRS} ${opencv4_INCLUDE_DIRS})
+target_link_libraries(yolov5s_rgba_fpga PUBLIC
+    ${axruntime_LIBRARIES} ${opencv4_LIBRARIES})
+target_link_directories(yolov5s_rgba_fpga PUBLIC
+    ${axruntime_LIBRARY_DIRS} ${opencv4_LIBRARY_DIRS})
+
+install(TARGETS ${PROJECT_NAME} yolov5s_rgba yolov5s_rgba_fpga RUNTIME DESTINATION bin)
