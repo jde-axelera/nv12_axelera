@@ -2,8 +2,11 @@
 #include <cstdint>
 #include "axruntime/axruntime.h"
 
-// Convert first frame of an NV12 buffer (src_w x src_h) into the model's
-// quantised int8 NHWC input tensor. Handles padding and BGR->RGB reorder.
-// YOLOv5 normalisation: pixel / 255  (no ImageNet mean/std).
 void nv12_to_tensor(const uint8_t* nv12, int src_w, int src_h,
+                    int8_t* out, const axrTensorInfo& info);
+
+// Convert an RGBA buffer (src_w x src_h, 4 bytes/pixel) into the model's
+// quantised int8 NHWC input tensor. Alpha channel is discarded; RGB channels
+// map directly to the model's expected R,G,B order (no cvtColor required).
+void rgba_to_tensor(const uint8_t* rgba, int src_w, int src_h,
                     int8_t* out, const axrTensorInfo& info);
