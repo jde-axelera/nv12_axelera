@@ -121,6 +121,18 @@ static void print_latency_table(
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+// Extract AIPU core count from model path (.../N/model.json → N, clamped 1–4)
+static int cores_from_path(const std::string& p)
+{
+    auto slash = p.rfind('/');
+    if (slash == std::string::npos || slash == 0) return 1;
+    auto prev = p.rfind('/', slash - 1);
+    const std::string ver = p.substr(prev + 1, slash - prev - 1);
+    int n = 1;
+    try { n = std::stoi(ver); } catch (...) {}
+    return std::clamp(n, 1, 4);
+}
+
 int main(int argc, char** argv)
 {
     std::string yolo_path, resnet_path, image_path, labels_path, out_path;
@@ -145,12 +157,17 @@ int main(int argc, char** argv)
             "Usage: %s --yolo=model.json --resnet=model.json [image] [labels]\n"
             "          [--size=WxH] [--output=path.jpg] [--warmup=N] [--runs=N]\n"
             "\n"
-            "  --yolo    : YOLOv5s version-2 model.json  (2 AIPU cores)\n"
-            "  --resnet  : ResNet50 version-2 model.json (2 AIPU cores)\n"
+            "  --yolo    : YOLOv5s model.json (version dir = number of AIPU cores)\n"
+            "  --resnet  : ResNet50 model.json (version dir = number of AIPU cores)\n"
+            "  e.g.  .../yolov5s-v7-coco/1/model.json  → 1 core\n"
+            "        .../yolov5s-v7-coco/2/model.json  → 2 cores\n"
             "  image     : .rgba file or JPEG/PNG\n",
             argv[0]);
         return 1;
     }
+
+    const int yolo_cores   = cores_from_path(yolo_path);
+    const int resnet_cores = cores_from_path(resnet_path);
 
     std::vector<std::string> labels;
     if (!labels_path.empty()) {
@@ -177,10 +194,13 @@ int main(int argc, char** argv)
 
     const std::string yolo_props =
         std::string(use_dmabuf ? "input_dmabuf=1" : "input_dmabuf=0")
-        + ";output_dmabuf=0;num_sub_devices=2;aipu_cores=2;double_buffer=0;elf_in_ddr=1";
+        + ";output_dmabuf=0;num_sub_devices=" + std::to_string(yolo_cores)
+        + ";aipu_cores=" + std::to_string(yolo_cores)
+        + ";double_buffer=0;elf_in_ddr=1";
     const std::string resnet_props =
-        "input_dmabuf=0"
-        ";output_dmabuf=0;num_sub_devices=2;aipu_cores=2;double_buffer=0;elf_in_ddr=1";
+        "input_dmabuf=0;output_dmabuf=0;num_sub_devices=" + std::to_string(resnet_cores)
+        + ";aipu_cores=" + std::to_string(resnet_cores)
+        + ";double_buffer=0;elf_in_ddr=1";
 
     Model yolo, resnet;
     if (!yolo.load(ctx.get(), conn, yolo_path.c_str(), yolo_props)) {
@@ -284,10 +304,13 @@ int main(int argc, char** argv)
     }
     std::printf("[INFO] Source: %dx%d RGBA  Embed dim: %zu\n\n", src_w, src_h, embed_dim);
 
-    // Helper: fill YOLO input for one buffer slot (both batch elements = same frame)
+    const int resnet_batch = static_cast<int>(resnet.in_info[0].dims[0]);
+
+    // Helper: fill YOLO input; duplicate frame across all batch slots
     auto preprocess_yolo = [&](int8_t* ptr) {
         rgba_to_tensor(rgba_bench.data(), src_w, src_h, ptr, yolo_single);
-        std::memcpy(ptr + yolo_single_sz, ptr, yolo_single_sz);  // duplicate to slot 1
+        for (int s = 1; s < yolo_cores; ++s)
+            std::memcpy(ptr + s * yolo_single_sz, ptr, yolo_single_sz);
     };
 
     // Helper: decode detections from batch slot 0 of YOLO output
@@ -304,14 +327,15 @@ int main(int argc, char** argv)
         return nms(std::move(cands), NMS_IOU_THR);
     };
 
-    // Helper: run ResNet50 on up to 2 detections and return embeddings (float)
-    auto embed_pair = [&](const Det& d0, const Det& d1) {
-        crop_to_tensor(rgba_bench.data(), src_w, src_h,
-                       d0.x1, d0.y1, d0.x2, d0.y2, YOLO_WH,
-                       resnet_in.get(), resnet_single);
-        crop_to_tensor(rgba_bench.data(), src_w, src_h,
-                       d1.x1, d1.y1, d1.x2, d1.y2, YOLO_WH,
-                       resnet_in.get() + resnet_single_sz, resnet_single);
+    // Helper: run ResNet50 on a batch of detections starting at dets[start]
+    // Fills up to resnet_batch slots; caller must pad dets to a multiple of resnet_batch.
+    auto embed_batch = [&](const std::vector<Det>& dets, size_t start) {
+        for (int s = 0; s < resnet_batch; ++s) {
+            const Det& d = dets[start + s];
+            crop_to_tensor(rgba_bench.data(), src_w, src_h,
+                           d.x1, d.y1, d.x2, d.y2, YOLO_WH,
+                           resnet_in.get() + s * resnet_single_sz, resnet_single);
+        }
         axr_run_model_instance(resnet.instance, &resnet_arg, 1,
                                resnet.out_args.data(), resnet.n_out);
     };
@@ -368,14 +392,13 @@ int main(int argc, char** argv)
         { ScopeTimer st(t_dec); dets = decode_yolo(); }
         last_dets = dets;
 
-        // ResNet50 — process detected crops in pairs
+        // ResNet50 — process detected crops in batches of resnet_batch
         if (!dets.empty()) {
-            // Pad to even count by duplicating last detection
-            if (dets.size() % 2 != 0) dets.push_back(dets.back());
-
-            for (size_t d = 0; d < dets.size(); d += 2) {
+            while (static_cast<int>(dets.size()) % resnet_batch != 0)
+                dets.push_back(dets.back());
+            for (size_t d = 0; d < dets.size(); d += resnet_batch) {
                 const auto tr = Clock::now();
-                embed_pair(dets[d], dets[d + 1]);
+                embed_batch(dets, d);
                 t_resnet.record(Ms(Clock::now() - tr).count());
             }
         }
@@ -384,7 +407,7 @@ int main(int argc, char** argv)
     }
 
     print_latency_table(t_pre, t_yolo, t_dec, t_resnet, t_wall,
-                        bench, use_dmabuf, 2);
+                        bench, use_dmabuf, resnet_cores);
 
     // ── Final pass: annotate image and print embeddings ───────────────────────
     preprocess_yolo(yolo_ptrs[0]);
@@ -392,28 +415,26 @@ int main(int argc, char** argv)
         yolo_args[0].data(), yolo.n_in, yolo.out_args.data(), yolo.n_out);
     last_dets = decode_yolo();
 
-    if (last_dets.size() % 2 != 0) last_dets.push_back(last_dets.back());
+    const size_t real_dets = last_dets.size();
+    while (static_cast<int>(last_dets.size()) % resnet_batch != 0)
+        last_dets.push_back(last_dets.back());
 
-    std::printf("[DETECTIONS + EMBEDDINGS]  %zu object(s)\n",
-                last_dets.size() % 2 == 0 ? last_dets.size()
-                                           : last_dets.size() - 1);
+    std::printf("[DETECTIONS + EMBEDDINGS]  %zu object(s)\n", real_dets);
 
-    for (size_t d = 0; d < last_dets.size(); d += 2) {
-        embed_pair(last_dets[d], last_dets[d + 1]);
+    const auto& ro  = resnet.out_info[0];
+    const float rsc = static_cast<float>(ro.scale);
+    const int   rzp = ro.zero_point;
 
-        const auto& ro   = resnet.out_info[0];
-        const float rsc  = static_cast<float>(ro.scale);
-        const int   rzp  = ro.zero_point;
+    for (size_t d = 0; d < last_dets.size(); d += resnet_batch) {
+        embed_batch(last_dets, d);
 
-        for (int slot = 0; slot < 2 && d + slot < last_dets.size(); ++slot) {
+        for (int slot = 0; slot < resnet_batch; ++slot) {
+            if (d + slot >= real_dets) break;  // skip padding slots
+
             const Det& det = last_dets[d + slot];
-            // Skip the padded duplicate
-            if (slot == 1 && d + 1 >= last_dets.size()) break;
-
             const std::string cls = det.cls < (int)labels.size()
                 ? labels[det.cls] : "cls" + std::to_string(det.cls);
 
-            // Embedding for this slot starts at slot × embed_dim
             const int8_t* emb = resnet.out_host[0].get() + slot * embed_dim;
             std::printf("  %-20s  conf=%.3f  embed[0..3]=[%.4f, %.4f, %.4f, %.4f]\n",
                 cls.c_str(), det.conf,
