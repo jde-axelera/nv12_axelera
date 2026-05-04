@@ -366,7 +366,7 @@ int main(int argc, char** argv)
     std::printf("[INFO] Benchmarking (%d runs)...\n\n", bench);
 
     SectionTimer t_pre   {"Preprocess RGBA"};
-    SectionTimer t_yolo  {"YOLO (2 cores)"};
+    SectionTimer t_yolo  {"YOLO v" + std::to_string(yolo_cores)};
     SectionTimer t_dec   {"Decode + NMS"};
     SectionTimer t_resnet{"ResNet50/call"};
     SectionTimer t_wall  {"Frame wall time"};

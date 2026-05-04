@@ -4,13 +4,14 @@ Real-time YOLOv5s-v7-coco detection pipeline for the Axelera Metis AIPU.
 Accepts raw camera frames (NV12 or RGBA), runs int8 inference on the AIPU,
 and returns bounding boxes with class labels and confidence scores.
 
-Three binaries are provided to match different camera integration scenarios:
+Four binaries are provided to match different camera integration scenarios:
 
 | Binary | Input source | Use when |
 |---|---|---|
 | `yolov5s_nv12` | `.nv12` / `.yuv` file or JPEG/PNG | Standard camera, NV12 output |
 | `yolov5s_rgba` | `.rgba` file or JPEG/PNG | FPGA/ISP that outputs raw RGBA |
 | `yolov5s_rgba_fpga` | `.rgba` file + DMA-BUF simulation | Testing FPGA DMA integration |
+| `yolov5s_cascade` | `.rgba` file + two model paths | Detection + per-object embedding (re-ID, classification) |
 
 ---
 
@@ -30,11 +31,16 @@ ninja -C build
 # → build/yolov5s_nv12, build/yolov5s_rgba, build/yolov5s_rgba_fpga
 ```
 
-### 2. Download the model
+### 2. Download the model(s)
 
 ```bash
+# Detection only (single pipeline)
 axdownloadmodel yolov5s-v7-coco
 # lands in: build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json
+
+# Cascade pipeline also needs ResNet50 for embedding
+axdownloadmodel resnet50-imagenet
+# lands in: build/resnet50-imagenet/resnet50-imagenet/1/model.json
 ```
 
 ### 3. Run
@@ -55,6 +61,15 @@ LABELS=$VOYAGER_SDK/ax_datasets/labels/coco.names
 # FPGA DMA simulation (run as root to print physical addresses)
 sudo ./build/yolov5s_rgba_fpga $MODEL input_images/dog_bike_768x576.rgba $LABELS \
     --size=768x576 --warmup=5 --runs=30 --output=output_images/result.jpg
+
+# Cascade: YOLOv5s detection → ResNet50 embedding
+# Version number in path = number of AIPU cores; v1+v2 is the fastest config
+YOLO_MODEL=build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json
+RESNET_MODEL=build/resnet50-imagenet/resnet50-imagenet/2/model.json
+./build/yolov5s_cascade \
+    --yolo=$YOLO_MODEL --resnet=$RESNET_MODEL \
+    input_images/dog_bike_768x576.rgba $LABELS \
+    --size=768x576 --warmup=5 --runs=30 --output=output_images/cascade_result.jpg
 ```
 
 Expected detections on `dog_bike_768x576`: **dog 88 %**, **car 65 %**, **bicycle 44 %**
@@ -348,6 +363,70 @@ double-buffer loop, decode, NMS.
 
 ---
 
+## Cascade pipeline: detection + embedding
+
+`yolov5s_cascade` runs two models in sequence per frame:
+
+```
+  RGBA frame  (768 × 576, 4 bytes/pixel)
+       │
+       │  Stage 1 — YOLOv5s detection  (AIPU, 1–2 cores)
+       │  rgba_to_tensor → int8 [1,644,656,4] → AIPU → 3 output heads
+       ▼
+  Bounding boxes  [x1,y1,x2,y2, conf, cls]  (e.g. dog 88%, car 65%, bicycle 44%)
+       │
+       │  For each detected object:
+       │
+       │  Stage 2 — ResNet50 embedding  (AIPU, 1–2 cores, batched)
+       │  crop_to_tensor: crop RGBA region → ImageNet-normalise → int8 [N,230,240,4]
+       │  Crops are batched in pairs (N=batch size of loaded model version)
+       ▼
+  1024-dim float embedding per object
+  (global average pooling layer — useful for re-ID or downstream classification)
+```
+
+### Model versions and AIPU cores
+
+The version directory in the model path sets the AIPU batch size and core count.
+The binary detects this automatically from the path:
+
+```
+.../yolov5s-v7-coco/1/model.json   →  1 core,  batch = 1
+.../yolov5s-v7-coco/2/model.json   →  2 cores, batch = 2  (fills two slots per inference)
+```
+
+The binary connects to `yolo_cores + resnet_cores` sub-devices so each model
+gets its own core's L2 memory (~8 MB each on Metis). Sharing a single sub-device
+causes both models to exceed the L2 budget.
+
+### ImageNet normalisation in `crop_to_tensor`
+
+ResNet50 expects ImageNet-normalised input, not the simple scale/zero_point
+quantisation used for YOLOv5s:
+
+```
+v = (pixel / 255 - mean[c]) / std[c]   with  mean=[0.485,0.456,0.406]  (R,G,B)
+                                               std =[0.229,0.224,0.225]
+int8 = clamp(v / scale + zero_point, -128, 127)   scale=0.0187, zp=-14
+```
+
+### Reading the embedding output
+
+The ResNet50 output tensor is `[N, 1, 1, 1024]` int8. Dequantise to float:
+
+```cpp
+const int8_t* emb = resnet.out_host[0].get() + slot * 1024;
+float f = (emb[i] - zero_point) * scale;   // scale=0.1253, zp=-64 → range [-2.1, 2.6]
+```
+
+### Double-buffer optimisation
+
+YOLO preprocessing (async thread, ~6.4 ms) overlaps YOLO inference (~9 ms),
+hiding preprocess latency. ResNet50 runs after YOLO completes (cascade
+dependency) — there is no double-buffer benefit for the ResNet50 stage.
+
+---
+
 ## Measured latency
 
 30-run benchmark, Axelera Metis PCIe, SDK 1.6, 768×576 source frame.
@@ -389,6 +468,50 @@ double-buffer loop, decode, NMS.
 
   (†) The FPGA DMA sim row is a memcpy (1.7 MB). With a real FPGA the
       DMA write runs concurrently with the AIPU — this row becomes ~0 ms.
+
+  yolov5s_cascade — cascade detection + ResNet50 embedding (768×576 RGBA, 3 detections)
+  ResNet50/call is the per-inference time; total ResNet50 time = calls × that value.
+
+  Config v1+v1 (YOLO: 1 core, ResNet50: 1 core, batch=1, 3 calls/frame):
+  +------------------+----------+----------+----------+----------+
+  | Section          |   avg ms |   min ms |   max ms |   p95 ms |
+  +------------------+----------+----------+----------+----------+
+  | Preprocess RGBA  |    6.423 |    5.456 |    7.207 |    6.636 |
+  | YOLO v1          |    9.019 |    6.672 |    9.535 |    9.448 |
+  | Decode + NMS     |    0.181 |    0.166 |    0.198 |    0.194 |
+  | ResNet50/call    |    4.571 |    3.373 |    7.662 |    6.308 |
+  | Frame wall time  |   23.002 |   21.664 |   24.830 |   23.714 |
+  +------------------+----------+----------+----------+----------+
+  Throughput: 43.5 FPS   YOLO alone: 108.7 FPS
+
+  Config v1+v2 ★ FASTEST (YOLO: 1 core, ResNet50: 2 cores, batch=2, 2 calls/frame):
+  +------------------+----------+----------+----------+----------+
+  | Section          |   avg ms |   min ms |   max ms |   p95 ms |
+  +------------------+----------+----------+----------+----------+
+  | Preprocess RGBA  |    6.413 |    5.325 |    6.693 |    6.644 |
+  | YOLO v1          |    8.973 |    6.216 |    9.391 |    9.362 |
+  | Decode + NMS     |    0.176 |    0.057 |    0.192 |    0.192 |
+  | ResNet50/call    |    6.252 |    4.927 |    8.878 |    7.453 |
+  | Frame wall time  |   21.728 |   20.529 |   22.291 |   22.158 |
+  +------------------+----------+----------+----------+----------+
+  Throughput: 46.0 FPS   YOLO alone: 109.3 FPS
+
+  Config v2+v2 (YOLO: 2 cores, ResNet50: 2 cores, all 4 cores, 2 calls/frame):
+  +------------------+----------+----------+----------+----------+
+  | Section          |   avg ms |   min ms |   max ms |   p95 ms |
+  +------------------+----------+----------+----------+----------+
+  | Preprocess RGBA  |    6.518 |    5.435 |    7.357 |    6.843 |
+  | YOLO v2          |   12.823 |    8.294 |   14.147 |   13.313 |
+  | Decode + NMS     |    0.221 |    0.212 |    0.292 |    0.226 |
+  | ResNet50/call    |    7.403 |    4.634 |    9.946 |    9.913 |
+  | Frame wall time  |   27.924 |   23.656 |   29.358 |   28.794 |
+  +------------------+----------+----------+----------+----------+
+  Throughput: 35.8 FPS   YOLO alone: 76.7 FPS
+
+  Key finding: more cores is NOT always faster on Metis for these models.
+  Single-core inference avoids multi-core synchronisation overhead.
+  The v1+v2 speedup over v1+v1 comes solely from halving ResNet50 calls
+  (batch=2 processes 2 crops per inference), not from parallel cores.
 ```
 
 ---
@@ -402,14 +525,15 @@ double-buffer loop, decode, NMS.
 ├── include/
 │   ├── annotate.hpp       save_annotated() — draw boxes, write JPEG
 │   ├── dmabuf.hpp         DmaBuf struct — alloc/mmap/release via dma_heap
-│   ├── preprocess.hpp     nv12_to_tensor(), rgba_to_tensor()
+│   ├── preprocess.hpp     nv12_to_tensor(), rgba_to_tensor(), crop_to_tensor()
 │   ├── timer.hpp          SectionTimer, ScopeTimer RAII helpers
 │   └── yolo_decode.hpp    Det struct, decode_head(), nms()
 ├── src/
-│   ├── main.cpp               NV12 pipeline        → yolov5s_nv12
-│   ├── main_rgba.cpp          RGBA file pipeline   → yolov5s_rgba
-│   ├── main_rgba_fpga.cpp     FPGA DMA simulation  → yolov5s_rgba_fpga
-│   ├── preprocess.cpp         nv12_to_tensor + rgba_to_tensor implementations
+│   ├── main.cpp               NV12 pipeline           → yolov5s_nv12
+│   ├── main_rgba.cpp          RGBA file pipeline      → yolov5s_rgba
+│   ├── main_rgba_fpga.cpp     FPGA DMA simulation     → yolov5s_rgba_fpga
+│   ├── main_cascade.cpp       YOLOv5s+ResNet50 cascade→ yolov5s_cascade
+│   ├── preprocess.cpp         nv12_to_tensor, rgba_to_tensor, crop_to_tensor
 │   ├── yolo_decode.cpp        anchor decode + NMS
 │   └── annotate.cpp           bounding box drawing
 ├── input_images/
