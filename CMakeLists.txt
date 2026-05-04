@@ -51,4 +51,15 @@ target_link_libraries(yolov5s_rgba_fpga PUBLIC
 target_link_directories(yolov5s_rgba_fpga PUBLIC
     ${axruntime_LIBRARY_DIRS} ${opencv4_LIBRARY_DIRS})
 
-install(TARGETS ${PROJECT_NAME} yolov5s_rgba yolov5s_rgba_fpga RUNTIME DESTINATION bin)
+# ── YOLOv5s → ResNet50 cascade pipeline ──────────────────────────────────────
+add_executable(yolov5s_cascade src/main_cascade.cpp ${SHARED_SOURCES})
+target_compile_options(yolov5s_cascade PRIVATE ${COMPILE_FLAGS})
+target_include_directories(yolov5s_cascade PRIVATE
+    include ${axruntime_INCLUDE_DIRS} ${opencv4_INCLUDE_DIRS})
+target_link_libraries(yolov5s_cascade PUBLIC
+    ${axruntime_LIBRARIES} ${opencv4_LIBRARIES})
+target_link_directories(yolov5s_cascade PUBLIC
+    ${axruntime_LIBRARY_DIRS} ${opencv4_LIBRARY_DIRS})
+
+install(TARGETS ${PROJECT_NAME} yolov5s_rgba yolov5s_rgba_fpga yolov5s_cascade
+        RUNTIME DESTINATION bin)
