@@ -33,7 +33,7 @@ ninja -C build
 ### 2. Download the model
 
 ```bash
-axdownloadmodel --model yolov5s-v7-coco
+axdownloadmodel yolov5s-v7-coco
 # lands in: build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json
 ```
 
