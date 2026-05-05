@@ -141,20 +141,21 @@ static int cores_from_path(const std::string& p)
 int main(int argc, char** argv)
 {
     std::string yolo_path, resnet_path, image_path, labels_path, out_path;
-    int warmup = 5, bench = 20, rgba_w = 0, rgba_h = 0;
+    int warmup = 5, bench = 20, rgba_w = 0, rgba_h = 0, db_flag = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string s(argv[i]);
-        if      (s.starts_with("--yolo="))    yolo_path   = s.substr(7);
-        else if (s.starts_with("--resnet="))  resnet_path = s.substr(9);
-        else if (s.starts_with("--warmup="))  warmup      = std::stoi(s.substr(9));
-        else if (s.starts_with("--runs="))    bench       = std::stoi(s.substr(7));
+        if      (s.starts_with("--yolo="))          yolo_path   = s.substr(7);
+        else if (s.starts_with("--resnet="))        resnet_path = s.substr(9);
+        else if (s.starts_with("--warmup="))        warmup      = std::stoi(s.substr(9));
+        else if (s.starts_with("--runs="))          bench       = std::stoi(s.substr(7));
+        else if (s.starts_with("--double-buffer=")) db_flag     = std::stoi(s.substr(16));
         else if (s.starts_with("--size="))
             std::sscanf(s.c_str() + 7, "%dx%d", &rgba_w, &rgba_h);
-        else if (s.starts_with("--output="))  out_path    = s.substr(9);
+        else if (s.starts_with("--output="))        out_path    = s.substr(9);
         else if (s.ends_with(".names") ||
-                 s.ends_with(".txt"))          labels_path = s;
-        else if (!s.starts_with("--"))         image_path  = s;
+                 s.ends_with(".txt"))               labels_path = s;
+        else if (!s.starts_with("--"))              image_path  = s;
     }
 
     if (yolo_path.empty() || resnet_path.empty()) {
@@ -206,12 +207,12 @@ int main(int argc, char** argv)
         std::string(use_dmabuf ? "input_dmabuf=1" : "input_dmabuf=0")
         + ";output_dmabuf=0;num_sub_devices=" + std::to_string(yolo_cores)
         + ";aipu_cores=" + std::to_string(yolo_cores)
-        + ";double_buffer=0;elf_in_ddr=1";
+        + ";double_buffer=" + std::to_string(db_flag) + ";elf_in_ddr=1";
     const std::string resnet_props =
         std::string(use_dmabuf ? "input_dmabuf=1" : "input_dmabuf=0")
         + ";output_dmabuf=0;num_sub_devices=" + std::to_string(resnet_cores)
         + ";aipu_cores=" + std::to_string(resnet_cores)
-        + ";double_buffer=0;elf_in_ddr=1";
+        + ";double_buffer=" + std::to_string(db_flag) + ";elf_in_ddr=1";
 
     Model yolo, resnet;
     if (!yolo.load(ctx.get(), conn, yolo_path.c_str(), yolo_props)) {
@@ -490,7 +491,12 @@ int main(int argc, char** argv)
     //    Async thread:  crop + ImageNet-normalise next batch        (~1 ms)
     //    Main thread:   AIPU inference on current batch             (~6 ms)
     //
-    std::printf("[INFO] Benchmarking (%d runs)...\n\n", bench);
+    //  Note: cross-frame YOLO+ResNet50 concurrent execution was tested and
+    //  crashes axruntime — axr_run_model_instance is not thread-safe across
+    //  instances (Level Zero global queue serialisation).
+    //
+    std::printf("[INFO] Benchmarking (%d runs, double_buffer=%d)...\n\n",
+                bench, db_flag);
 
     SectionTimer t_pre   {"Preprocess RGBA"};
     SectionTimer t_yolo  {"YOLO v" + std::to_string(yolo_cores)};
