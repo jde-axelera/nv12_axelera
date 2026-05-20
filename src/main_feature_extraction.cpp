@@ -3,7 +3,7 @@
 // Accepts any compiled embedding model (ResNet18, ResNet50 backbone, etc.)
 // produced by axcompile with ImageNet preprocessing.
 //
-// Preprocessing:  RGBA → resize → ImageNet normalise → int8 NHWC
+// Preprocessing:  RGBA → resize → pixel/255 → int8 NHWC
 // Pipeline:       double-buffered DMA-BUF (preprocess hides behind AIPU)
 // Output:         float embedding vector; first 6 values printed to console
 //
@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "opencv2/opencv.hpp"
 #include "axruntime/axruntime.hpp"
 #include "dmabuf.hpp"
 #include "preprocess.hpp"
@@ -131,11 +132,17 @@ int main(int argc, char** argv)
         std::printf("] scale=%g zp=%d\n", t.scale, t.zero_point);
     }
 
-    // embed_dim = product of all non-batch output dims (handles [1,512] and [1,1,1,512])
-    size_t embed_dim = 1;
-    for (size_t d = 1; d < out_info[0].ndims; ++d)
-        embed_dim *= out_info[0].dims[d];
-    std::printf("[INFO] Embedding dim: %zu\n\n", embed_dim);
+    // AIPU output is NHWC: [N, H, W, C].
+    // axcompile may split avgpool+flatten to CPU postprocess, so the AIPU
+    // outputs the spatial feature map [N, H, W, C] rather than [N, C].
+    // We apply global average pooling over H×W here to get the C-dim embedding.
+    // If H=W=1 (e.g. ResNet50 compiled with avgpool on AIPU), this is a no-op.
+    const size_t out_H     = out_info[0].ndims >= 2 ? out_info[0].dims[1] : 1;
+    const size_t out_W     = out_info[0].ndims >= 3 ? out_info[0].dims[2] : 1;
+    const size_t embed_dim = out_info[0].ndims >= 4 ? out_info[0].dims[3]
+                           : out_info[0].dims[out_info[0].ndims - 1];
+    std::printf("[INFO] Embedding dim: %zu  (AIPU output: %zux%zu spatial → global avg pool)\n\n",
+                embed_dim, out_H, out_W);
 
     // ── DMA-BUF double-buffer input ───────────────────────────────────────────
     int heap_fd    = ::open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
@@ -237,8 +244,10 @@ int main(int argc, char** argv)
     }
 
     // ── Preprocess lambda ─────────────────────────────────────────────────────
+    // pixel/255 normalisation matches random-calibration scale (≈1/256, zp=-128).
+    // Use rgba_to_tensor_imagenet instead if the model was compiled with --transform.
     auto preprocess = [&](int8_t* ptr) {
-        rgba_to_tensor_imagenet(rgba_data.data(), src_w, src_h, ptr, in_info[0]);
+        rgba_to_tensor(rgba_data.data(), src_w, src_h, ptr, in_info[0]);
     };
 
     // ── Prime buf[0] + warmup ─────────────────────────────────────────────────
@@ -291,10 +300,17 @@ int main(int argc, char** argv)
     const float out_scale = static_cast<float>(out_info[0].scale);
     const int   out_zp    = out_info[0].zero_point;
 
-    std::vector<float> embedding(embed_dim);
-    const int8_t* raw = out_host[0].get();
-    for (size_t j = 0; j < embed_dim; ++j)
-        embedding[j] = (static_cast<float>(raw[j]) - out_zp) * out_scale;
+    // Global average pool: dequantise and average over H×W spatial dims.
+    // NHWC layout: element [y,x,c] = raw[(y*out_W + x)*embed_dim + c]
+    std::vector<float> embedding(embed_dim, 0.0f);
+    const int8_t* raw     = out_host[0].get();
+    const float   inv_hw  = 1.0f / static_cast<float>(out_H * out_W);
+    for (size_t y = 0; y < out_H; ++y)
+        for (size_t x = 0; x < out_W; ++x)
+            for (size_t c = 0; c < embed_dim; ++c)
+                embedding[c] += (static_cast<float>(
+                    raw[(y * out_W + x) * embed_dim + c]) - out_zp) * out_scale;
+    for (float& v : embedding) v *= inv_hw;
 
     float norm_sq = 0.0f;
     for (float v : embedding) norm_sq += v * v;

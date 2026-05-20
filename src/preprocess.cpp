@@ -49,6 +49,50 @@ void nv12_to_tensor(const uint8_t* nv12, int src_w, int src_h,
     std::fill_n(out, ypr * W * C, pval);
 }
 
+void rgba_to_tensor(const uint8_t* rgba, int src_w, int src_h,
+                    int8_t* out, const axrTensorInfo& info)
+{
+    const int H   = static_cast<int>(info.dims[1]);
+    const int W   = static_cast<int>(info.dims[2]);
+    const int C   = static_cast<int>(info.dims[3]);
+    const int ypl = static_cast<int>(info.padding[1][0]);
+    const int ypr = static_cast<int>(info.padding[1][1]);
+    const int xpl = static_cast<int>(info.padding[2][0]);
+    const int xpr = static_cast<int>(info.padding[2][1]);
+    const int cpl = static_cast<int>(info.padding[3][0]);
+    const int cpr = static_cast<int>(info.padding[3][1]);
+    const int uH  = H - ypl - ypr;
+    const int uW  = W - xpl - xpr;
+
+    cv::Mat src(src_h, src_w, CV_8UC4, const_cast<uint8_t*>(rgba));
+    cv::Mat bgr;
+    cv::cvtColor(src, bgr, cv::COLOR_RGBA2BGR);
+    cv::Mat resized;
+    cv::resize(bgr, resized, cv::Size(uW, uH), 0, 0, cv::INTER_LINEAR);
+
+    const float  scale = static_cast<float>(info.scale);
+    const int    zp    = info.zero_point;
+    const float  mul   = 1.0f / (scale * 255.0f);
+    const float  add   = static_cast<float>(zp);
+    const int8_t pval  = static_cast<int8_t>(std::clamp(zp, -128, 127));
+
+    out = std::fill_n(out, ypl * W * C, pval);
+    for (int y = 0; y < uH; ++y) {
+        out = std::fill_n(out, xpl * C, pval);
+        for (int x = 0; x < uW; ++x) {
+            out = std::fill_n(out, cpl, pval);
+            const uint8_t* px = resized.data + (y * uW + x) * 3;
+            for (int c = 0; c < 3; ++c) {
+                float v = static_cast<float>(px[2 - c]) * mul + add;
+                *out++  = static_cast<int8_t>(std::clamp(v, -128.0f, 127.0f));
+            }
+            out = std::fill_n(out, cpr, pval);
+        }
+        out = std::fill_n(out, xpr * C, pval);
+    }
+    std::fill_n(out, ypr * W * C, pval);
+}
+
 void rgba_to_tensor_imagenet(const uint8_t* rgba, int src_w, int src_h,
                               int8_t* out, const axrTensorInfo& info)
 {
@@ -68,7 +112,6 @@ void rgba_to_tensor_imagenet(const uint8_t* rgba, int src_w, int src_h,
     const int uH  = H - ypl - ypr;
     const int uW  = W - xpl - xpr;
 
-    // RGBA → BGR (OpenCV native), then resize to unpadded model input size
     cv::Mat src(src_h, src_w, CV_8UC4, const_cast<uint8_t*>(rgba));
     cv::Mat bgr;
     cv::cvtColor(src, bgr, cv::COLOR_RGBA2BGR);
@@ -85,8 +128,6 @@ void rgba_to_tensor_imagenet(const uint8_t* rgba, int src_w, int src_h,
         for (int x = 0; x < uW; ++x) {
             out = std::fill_n(out, cpl, pval);
             const uint8_t* px = resized.data + (y * uW + x) * 3;
-            // BGR pixel: px[0]=B, px[1]=G, px[2]=R
-            // Model expects RGB channels: c=0→R=px[2], c=1→G=px[1], c=2→B=px[0]
             for (int c = 0; c < 3; ++c) {
                 float pf = px[2 - c] / 255.0f;
                 float nv = (pf - MEAN[c]) / STD[c];

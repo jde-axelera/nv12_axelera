@@ -9,8 +9,13 @@ void nv12_to_tensor(const uint8_t* nv12, int src_w, int src_h,
                     int8_t* out, const axrTensorInfo& info);
 
 // Convert an RGBA buffer (src_w x src_h) into the model's quantised int8
-// NHWC input tensor using ImageNet normalisation:
+// NHWC input tensor. Normalisation: pixel / 255 (no ImageNet mean/std).
+// Use when the model was compiled with default/random calibration (no --transform).
+void rgba_to_tensor(const uint8_t* rgba, int src_w, int src_h,
+                    int8_t* out, const axrTensorInfo& info);
+
+// Same as rgba_to_tensor but applies ImageNet normalisation:
 //   v = (pixel_rgb / 255 - mean[c]) / std[c]  then quantise to int8.
-// Resize is done inside. Suitable for ResNet18/50 embedding models.
+// Use only when the model was compiled with a matching --transform imagenet_transform.py.
 void rgba_to_tensor_imagenet(const uint8_t* rgba, int src_w, int src_h,
                               int8_t* out, const axrTensorInfo& info);
