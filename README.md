@@ -1,47 +1,56 @@
-# YOLOv5s — NV12 Object Detection on Axelera Metis
+# Axelera EVS — NV12 Detection + Embedding Extraction
 
-Real-time object detection pipeline that accepts raw NV12 camera frames (or
-JPEG/PNG via NV12 simulation), preprocesses them on the CPU, runs YOLOv5s on
-the Axelera Metis AIPU, decodes the three detection heads, applies NMS, and
-saves an annotated JPEG.  Per-section latency breakdown is printed after each
-benchmark run.
+Two C++ inference pipelines for the Axelera Metis AIPU:
+
+| Binary | Model | Input | Output |
+|---|---|---|---|
+| `yolov5s_nv12` | YOLOv5s COCO | Raw NV12 frames or JPEG/PNG | Bounding boxes + annotated JPEG |
+| `feature_extraction` | Any embedding model (e.g. ResNet18) | RGBA frames or JPEG/PNG | Float embedding vector |
+
+Both use a **double-buffered DMA-BUF pipeline**: two pinned input buffers alternate each frame so CPU preprocessing overlaps AIPU inference.
 
 ---
 
-## Pipeline
+## Pipeline — yolov5s_nv12
 
 ```
 Camera / File
-    |
-    v
+    │
+    ▼
 NV12 Buffer (raw YUV420 semi-planar)
-    |
-    +-------[Thread: preprocess next frame into buf[nxt]]
-    |                                                    |
-    v  [Preprocess — CPU, buf[cur]]                      | (overlaps)
-    |   cvtColor NV12→BGR, resize letterbox,             |
-    |   quantise → int8 NHWC                             |
-    v                                                    |
-DMA-BUF Input Tensor  (zero-copy to AIPU)                |
-    |                                                    |
-    v  [Inference — AIPU, buf[cur]] (~6 ms)              |
-    |   YOLOv5s int8 (post-sigmoid outputs on chip)      |
-    v                                                    |
-3 x Output Tensors  (host memory, int8)  <---------------+
-    |                   (thread done, buf[nxt] ready for next iter)
-    v  [Decode + NMS — CPU]
-    |   decode_head × 3 strides  →  candidate Det list
-    |   greedy per-class NMS (IoU 0.45)
-    v
-Annotated JPEG  (bounding boxes + labels)
+    │
+    ├─── [Thread: preprocess buf[nxt]] ──────────────────────────┐
+    │     NV12→BGR, resize+letterbox, quantise → int8 NHWC       │ (~2 ms)
+    │                                                             │
+    ▼   [Inference — AIPU, buf[cur]]  (~6 ms)                    │
+    │    YOLOv5s int8 (sigmoid fused on-chip)                     │
+    ▼                                                             │
+3 × Output Tensors (host memory, int8) ◄────────────────────────┘
+    │                  (thread done; buf[nxt] ready for next iter)
+    ▼   [Decode + NMS — CPU]
+    │    decode_head × 3 strides → Det list → greedy NMS (IoU 0.45)
+    ▼
+Annotated JPEG
 ```
 
-The benchmark uses a **double-buffer pipeline**: two DMA-BUF input allocations
-(`buf[0]` and `buf[1]`) alternate each frame.  A `std::async` thread preprocesses
-frame N+1 into `buf[nxt]` while the AIPU runs frame N on `buf[cur]`.  Because
-preprocess (~2 ms) completes well before inference (~6 ms), the CPU thread is
-already done by the time the main thread calls `future.get()` — so the per-frame
-wall time approaches the inference time alone.
+## Pipeline — feature_extraction
+
+```
+RGBA / JPEG / PNG
+    │
+    ├─── [Thread: preprocess buf[nxt]] ──────────────────────────┐
+    │     RGBA→BGR, resize to 224×224, pixel/255 → int8 NHWC     │ (~0.6 ms)
+    │                                                             │
+    ▼   [Inference — AIPU, buf[cur]]  (~1.2 ms)                  │
+    │    ResNet18 (or any embedding model)                         │
+    ▼                                                             │
+NHWC Output [1, H, W, C] (host memory, int8) ◄──────────────────┘
+    │
+    ▼   [Global avg pool + dequantise — CPU]
+    │    average over H×W spatial dims → float[C]
+    ▼
+Embedding vector  (512-dim for ResNet18)
+```
 
 ---
 
@@ -54,16 +63,21 @@ wall time approaches the inference time alone.
 | OpenCV 4 | `pkg-config --modversion opencv4` |
 | CMake >= 3.12, Ninja | `apt install cmake ninja-build` |
 | GCC >= 11 (C++20) | `gcc --version` |
-| YOLOv5s COCO model | see Download section |
 
 ---
 
-## Download the model
+## Download models
 
 ```bash
 source $VOYAGER_SDK/venv/bin/activate
+
+# YOLOv5s COCO
 axdownloadmodel --model yolov5s-v7-coco
-# model lands in:  build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json
+# → build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json
+
+# ResNet18 embedding (compile from ONNX — see scripts/)
+bash scripts/compile_resnet18_embedding.sh
+# → $VOYAGER_SDK/build/resnet18-embedding/resnet18-embedding/1/compiled_model/model.json
 ```
 
 ---
@@ -79,14 +93,12 @@ export AXELERA_RUNTIME_DIR=$(python -c 'from axelera.runtime.configs import runt
 PKG_CONFIG_PATH=$AXELERA_RUNTIME_DIR/lib/pkgconfig \
     cmake -Bbuild -GNinja . -DCMAKE_BUILD_TYPE=Release
 
-ninja -C build
+ninja -C build          # builds both yolov5s_nv12 and feature_extraction
 ```
-
-The binary is `build/yolov5s_nv12`.
 
 ---
 
-## Usage
+## Usage — yolov5s_nv12
 
 ```
 ./build/yolov5s_nv12  model.json  [image]  [labels.names]
@@ -97,18 +109,14 @@ The binary is `build/yolov5s_nv12`.
 | Flag | Default | Description |
 |---|---|---|
 | `model.json` | required | Axelera model descriptor |
-| `image` | synthetic grey | JPEG / PNG **or** raw `.nv12` / `.yuv` |
-| `labels.names` | (no labels) | One class name per line (COCO: 80 lines) |
-| `--size=WxH` | 1920x1080 or filename-parsed | NV12/YUV frame dimensions |
+| `image` | synthetic grey | JPEG/PNG **or** raw `.nv12`/`.yuv` |
+| `labels.names` | (no labels) | One class name per line |
+| `--size=WxH` | 1920×1080 or filename-parsed | NV12/YUV frame dimensions |
 | `--output=path` | `<image>_detections.jpg` | Output JPEG path |
-| `--warmup=N` | 5 | Warmup iterations (not timed) |
+| `--warmup=N` | 5 | Warmup iterations |
 | `--runs=N` | 20 | Benchmark iterations |
 
----
-
-## Example commands
-
-### Dog + bicycle (768 x 576 NV12)
+### Example
 
 ```bash
 export LD_LIBRARY_PATH=/opt/axelera/runtime-1.6.0-1/lib:$LD_LIBRARY_PATH
@@ -121,30 +129,9 @@ export LD_LIBRARY_PATH=/opt/axelera/runtime-1.6.0-1/lib:$LD_LIBRARY_PATH
     --output=output_images/dog_bike_result.jpg
 ```
 
-Expected detections: **dog 89 %**, **bicycle 45 %**, **car 65 %**
+Expected: **dog 89 %**, **bicycle 45 %**, **car 65 %**
 
-### Tulips (QCIF 176 x 144 NV12)
-
-```bash
-./build/yolov5s_nv12 \
-    $VOYAGER_SDK/build/yolov5s-v7-coco/yolov5s-v7-coco/1/model.json \
-    input_images/tulips_nv12_prog_qcif.yuv \
-    $VOYAGER_SDK/ax_datasets/labels/coco.names \
-    --size=176x144 --warmup=5 --runs=30 \
-    --output=output_images/tulips_result.jpg
-```
-
-Expected detection: **vase 38 %**
-
----
-
-## Per-section latency table
-
-After benchmarking the tool prints a breakdown of each pipeline stage.  The
-benchmark uses the double-buffer pipeline, so **Frame wall time** reflects the
-actual steady-state per-frame time (preprocess overlaps inference).
-**Sequential latency** is the sum of all stages as if run back-to-back and
-represents the minimum end-to-end latency for a single frame.
+### Latency (768×576 NV12, Metis SDK 1.6)
 
 ```
 +--------------------------------------------------------------------+
@@ -162,18 +149,75 @@ represents the minimum end-to-end latency for a single frame.
 +--------------------------------------------------------------------+
 ```
 
-Measured on dog_bike_768x576.nv12, Axelera Metis, SDK 1.6.
+---
 
-### Why pipelined FPS > sequential FPS
+## Usage — feature_extraction
 
-| Mode | Formula | FPS |
+```
+./build/feature_extraction  --model=model.json  [image]
+                            [--size=WxH]  [--output-emb=emb.txt]
+                            [--warmup=N]  [--runs=N]
+```
+
+| Flag | Default | Description |
 |---|---|---|
-| Sequential (old) | pre + inf + dec = 8.1 ms | ~124 FPS |
-| Pipelined (double-buffer) | max(pre, inf) + dec = 6.1 ms | ~163 FPS |
+| `--model=model.json` | required | Axelera model descriptor |
+| `image` | synthetic grey | JPEG/PNG **or** raw `.rgba` |
+| `--size=WxH` | 640×640 or filename-parsed | RGBA frame dimensions |
+| `--output-emb=path` | (not saved) | Save float embedding for ONNX comparison |
+| `--warmup=N` | 5 | Warmup iterations |
+| `--runs=N` | 30 | Benchmark iterations |
 
-The bottleneck is always the AIPU inference (~6 ms).  By hiding the 2 ms
-preprocess behind inference, the pipeline runs at close to bare-metal AIPU
-throughput.
+### Example
+
+```bash
+export LD_LIBRARY_PATH=/opt/axelera/runtime-1.6.0-1/lib:$LD_LIBRARY_PATH
+MODEL=$VOYAGER_SDK/build/resnet18-embedding/resnet18-embedding/1/compiled_model/model.json
+
+./build/feature_extraction \
+    --model=$MODEL \
+    input_images/dog_bike_768x576.rgba \
+    --size=768x576 --warmup=5 --runs=30 \
+    --output-emb=aipu_embedding.txt
+```
+
+### Verify against ONNX reference
+
+```bash
+source $VOYAGER_SDK/venv/bin/activate
+
+python scripts/verify_onnx_embedding.py \
+    --onnx models/resnet18_embedding.onnx \
+    --image input_images/dog_bike_768x576.rgba \
+    --size 768x576 \
+    --aipu aipu_embedding.txt
+```
+
+Expected output:
+```
+[ONNX]  dim=512  norm=29.64
+[AIPU]  dim=512  norm=29.45
+[COMPARE]  cosine_similarity=0.9983  L2_error=1.73
+  ✓ Excellent match (cosine > 0.99)
+```
+
+### Latency (ResNet18, 768×576 RGBA input, Metis SDK 1.6)
+
+```
++--------------------------------------------------------------------+
+| LATENCY BREAKDOWN  (30 runs, DMA-BUF input, double-buffered pipeline)
+| Embedding dim: 512    AIPU: 1 core(s)
++------------------+----------+----------+----------+----------+
+| Section          |   avg ms |   min ms |   max ms |   p95 ms |
++------------------+----------+----------+----------+----------+
+| Preprocess       |    0.656 |    0.375 |    0.873 |    0.851 |
+| Inference (AIPU) |    1.219 |    1.115 |    1.835 |    1.512 |
+| Frame wall time  |    1.243 |    1.145 |    1.859 |    1.612 |
++------------------+----------+----------+----------+----------+
+| Throughput (pipelined):  804.3 FPS
+| Sequential latency:      1.875 ms  (pre+inf, non-overlapped)
++--------------------------------------------------------------------+
+```
 
 ---
 
@@ -184,22 +228,29 @@ throughput.
 ├── CMakeLists.txt
 ├── README.md
 ├── include/
-│   ├── annotate.hpp      — save_annotated(): draw boxes, save JPEG
-│   ├── dmabuf.hpp        — DmaBuf struct: alloc/release via /dev/dma_heap/system
-│   ├── preprocess.hpp    — nv12_to_tensor(): NV12 -> int8 NHWC tensor
-│   ├── timer.hpp         — SectionTimer + ScopeTimer RAII
-│   └── yolo_decode.hpp   — Det struct, decode_head(), nms()
+│   ├── annotate.hpp       — save_annotated(): draw boxes, save JPEG
+│   ├── dmabuf.hpp         — DmaBuf: alloc/release via /dev/dma_heap/system
+│   ├── preprocess.hpp     — nv12_to_tensor, rgba_to_tensor, rgba_to_tensor_imagenet
+│   ├── timer.hpp          — SectionTimer + ScopeTimer RAII helpers
+│   └── yolo_decode.hpp    — Det struct, decode_head(), nms()
 ├── src/
-│   ├── main.cpp          — arg parsing, runtime setup, double-buffer pipeline, latency table
+│   ├── main.cpp                   — yolov5s_nv12: NV12 detection pipeline
+│   ├── main_feature_extraction.cpp — feature_extraction: generic embedding runner
 │   ├── annotate.cpp
-│   ├── preprocess.cpp
+│   ├── preprocess.cpp             — TensorLayout helper; NV12/RGBA→int8 NHWC
 │   └── yolo_decode.cpp
+├── scripts/
+│   ├── compile_resnet18_embedding.sh — end-to-end: export ONNX + axcompile
+│   ├── export_resnet18_headless.py   — remove FC head, export [1,512] ONNX
+│   ├── pixel255_transform.py         — axcompile calibration transform (pixel/255)
+│   ├── imagenet_transform.py         — axcompile calibration transform (ImageNet norm)
+│   └── verify_onnx_embedding.py      — compare AIPU embedding vs ONNX reference
 ├── input_images/
 │   ├── dog_bike_768x576.nv12
+│   ├── dog_bike_768x576.rgba
 │   └── tulips_nv12_prog_qcif.yuv
 └── output_images/
-    ├── dog_bike_result.jpg
-    └── tulips_result.jpg
+    └── *.jpg
 ```
 
 ---
@@ -207,50 +258,40 @@ throughput.
 ## Implementation notes
 
 ### Double-buffer DMA-BUF pipeline
-Two DMA-BUF allocations (`buf[0]`, `buf[1]`) are made at startup.  The
-benchmark loop alternates between them using `cur = i & 1` and `nxt = cur ^ 1`.
-A `std::async(std::launch::async, ...)` thread writes the preprocessed tensor
-into `buf[nxt]` while `axr_run_model_instance` blocks on `buf[cur]`.  The
-future's return value carries the thread's measured preprocess time.
-
-```cpp
-auto pre_fut = std::async(std::launch::async,
-    [src, w, h, nxt_ptr, &info]() -> double {
-        auto t0 = Clock::now();
-        nv12_to_tensor(src, w, h, nxt_ptr, info);
-        return Ms(Clock::now() - t0).count();
-    });
-
-{ ScopeTimer st(t_inf);
-  axr_run_model_instance(instance, in_args[cur].data(), ...); }
-
-t_pre.record(pre_fut.get());   // already done; no stall
-```
+Two DMA-BUF allocations (`buf[0]`, `buf[1]`) are made at startup.  The benchmark
+loop alternates using `cur = i & 1` / `nxt = cur ^ 1`.  A `std::async` thread
+writes the next preprocessed tensor into `buf[nxt]` while `axr_run_model_instance`
+blocks on `buf[cur]`.  Because preprocess finishes well before inference, the
+`future.get()` call never stalls and wall time approaches bare-metal AIPU time.
 
 ### DMA-BUF zero-copy input
-When `/dev/dma_heap/system` is available, the preprocessed input tensor is
-written directly into a DMA-BUF-backed allocation.  The AIPU reads it without
-any extra copy (`input_dmabuf=1`).  If the heap is unavailable the code falls
-back to host memory with a warning.
+When `/dev/dma_heap/system` is available the AIPU reads directly from the
+DMA-BUF allocation (`input_dmabuf=1`).  Falls back to host memory with a warning.
 
 ### Why `output_dmabuf=0`
-Output tensors are MMIO-mapped registers on the Metis device.  The axruntime
-does not support DMA-BUF for MMIO outputs; attempting to set `output_dmabuf=1`
-returns an error at runtime.  Host memory pointers are used for all outputs.
+Metis MMIO outputs are not DMA-BUF capable.  Attempting `output_dmabuf=1` fails
+at runtime.
 
-### Post-sigmoid outputs
-YOLOv5s is compiled with the sigmoid activations fused into the AIPU graph.
-`decode_head` therefore dequantises the raw int8 values directly — **do not
-apply sigmoid again**.  Objectness and class scores are already in [0, 1]
+### Post-sigmoid outputs (yolov5s_nv12)
+YOLOv5s is compiled with sigmoid fused into the AIPU graph.  `decode_head`
+dequantises raw int8 values directly — **do not apply sigmoid again**.
+
+### Global average pool (feature_extraction)
+axcompile splits avgpool+flatten to a CPU postprocess graph, so the AIPU outputs
+`[1, H, W, C]` (e.g. `[1, 7, 7, 512]` for ResNet18), not a flat `[1, 512]`.
+The binary applies global average pooling over the H×W spatial dimensions in C++
 after dequantisation.
 
-### Coordinate space
-All bounding boxes produced by `decode_head` are in the model's 640 x 640
-input coordinate space.  `save_annotated` scales them back to the original
-image resolution before drawing.
+### Preprocessing and calibration (feature_extraction)
+`rgba_to_tensor` (pixel/255, no mean/std) matches the default axcompile
+calibration range: `scale ≈ 1/255`, `zp = -128`.  If you recompile with
+`--transform imagenet_transform.py`, switch to `rgba_to_tensor_imagenet`.
 
-### NV12 format requirements
-The NV12 decoder (`cv::COLOR_YUV2BGR_NV12`) requires even width and height.
-If the source image has odd dimensions, `main.cpp` rounds up to the nearest
-even size before conversion.  The extra pixel column/row is filled by OpenCV
-and does not affect detection accuracy for typical images.
+`pixel255_transform.py` bundles two workarounds for axcompile's multiprocessing:
+1. Self-registration in `sys.modules` — fixes the "not the same object" pickle error.
+2. cloudpickle `ForkingPickler` patch — fixes axcompile's own internal lambda error.
+Run with `PYTHONPATH=scripts/` so the spawned worker can import the module by name.
+
+### NV12 dimension requirements
+`cv::COLOR_YUV2BGR_NV12` requires even width and height.  `bgr_to_nv12()` rounds
+up odd dimensions before conversion.

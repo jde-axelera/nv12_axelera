@@ -1,12 +1,5 @@
 // Generic embedding feature extraction on Axelera Metis AIPU.
-//
-// Accepts any compiled embedding model (ResNet18, ResNet50 backbone, etc.)
-// produced by axcompile with ImageNet preprocessing.
-//
-// Preprocessing:  RGBA → resize → pixel/255 → int8 NHWC
-// Pipeline:       double-buffered DMA-BUF (preprocess hides behind AIPU)
-// Output:         float embedding vector; first 6 values printed to console
-//
+// Accepts any compiled embedding model (ResNet18, ResNet50 backbone, etc.).
 // Copyright Axelera AI, 2026
 
 #include <array>
@@ -34,26 +27,26 @@ static void print_latency_table(
     const SectionTimer& t_wall,
     int runs, bool use_dmabuf, size_t embed_dim, int n_cores)
 {
-    std::printf("\n+----------------------------------------------------------------------+\n");
-    std::printf("| LATENCY BREAKDOWN  (%d runs, %s)\n",
-                runs, use_dmabuf ? "DMA-BUF" : "host-mem");
-    std::printf("| Embedding dim: %zu    AIPU: %d core(s)    double-buffered pipeline\n",
-                embed_dim, n_cores);
-    std::printf("+--------------------+----------+----------+----------+----------+\n");
-    std::printf("| %-18s | %8s | %8s | %8s | %8s |\n",
+    std::printf("\n+--------------------------------------------------------------------+\n");
+    std::printf("| LATENCY BREAKDOWN  (%d runs, %s, double-buffered pipeline)\n",
+                runs, use_dmabuf ? "DMA-BUF input" : "host-mem input");
+    std::printf("| Embedding dim: %zu    AIPU: %d core(s)\n", embed_dim, n_cores);
+    std::printf("+------------------+----------+----------+----------+----------+\n");
+    std::printf("| %-16s | %8s | %8s | %8s | %8s |\n",
                 "Section", "avg ms", "min ms", "max ms", "p95 ms");
-    std::printf("+--------------------+----------+----------+----------+----------+\n");
+    std::printf("+------------------+----------+----------+----------+----------+\n");
     auto row = [](const SectionTimer& t) {
-        std::printf("| %-18s | %8.3f | %8.3f | %8.3f | %8.3f |\n",
+        std::printf("| %-16s | %8.3f | %8.3f | %8.3f | %8.3f |\n",
                     t.name.c_str(), t.avg(), t.min(), t.max(), t.p95());
     };
     row(t_pre);
     row(t_inf);
     row(t_wall);
-    std::printf("+--------------------+----------+----------+----------+----------+\n");
-    std::printf("| Throughput (pipelined): %.1f FPS   Sequential latency: %.3f ms\n",
-                1000.0 / t_wall.avg(), t_pre.avg() + t_inf.avg());
-    std::printf("+----------------------------------------------------------------------+\n\n");
+    std::printf("+------------------+----------+----------+----------+----------+\n");
+    std::printf("| Throughput (pipelined):  %.1f FPS\n", 1000.0 / t_wall.avg());
+    std::printf("| Sequential latency:      %.3f ms  (pre+inf, non-overlapped)\n",
+                t_pre.avg() + t_inf.avg());
+    std::printf("+--------------------------------------------------------------------+\n\n");
 }
 
 // ── Core count from model path (.../N/model.json → N) ─────────────────────────
@@ -244,8 +237,6 @@ int main(int argc, char** argv)
     }
 
     // ── Preprocess lambda ─────────────────────────────────────────────────────
-    // pixel/255 normalisation matches random-calibration scale (≈1/256, zp=-128).
-    // Use rgba_to_tensor_imagenet instead if the model was compiled with --transform.
     auto preprocess = [&](int8_t* ptr) {
         rgba_to_tensor(rgba_data.data(), src_w, src_h, ptr, in_info[0]);
     };

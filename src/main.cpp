@@ -5,7 +5,6 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <future>
 #include <numeric>
@@ -15,14 +14,41 @@
 
 #include "axruntime/axruntime.hpp"
 
+#include "annotate.hpp"
 #include "dmabuf.hpp"
 #include "preprocess.hpp"
-#include "yolo_decode.hpp"
-#include "annotate.hpp"
 #include "timer.hpp"
+#include "yolo_decode.hpp"
 
 static constexpr float NMS_IOU_THR = 0.45f;
 static constexpr int   MODEL_WH    = 640;
+
+// Map YOLO output grid height to stride index (0=large, 1=medium, 2=small).
+static int grid_to_sid(size_t grid_h) noexcept {
+    if (grid_h >= 70) return 0;
+    if (grid_h >= 35) return 1;
+    return 2;
+}
+
+// Convert a BGR cv::Mat to packed NV12.  Rounds up odd dimensions in-place.
+// Returns {nv12_bytes, actual_size} where actual_size may differ from input
+// when rounding up was needed.
+static std::pair<std::vector<uint8_t>, cv::Size> bgr_to_nv12(cv::Mat bgr)
+{
+    if (bgr.cols % 2 || bgr.rows % 2)
+        cv::resize(bgr, bgr,
+            cv::Size(bgr.cols + bgr.cols % 2, bgr.rows + bgr.rows % 2));
+    const int w = bgr.cols, h = bgr.rows;
+    cv::Mat i420;
+    cv::cvtColor(bgr, i420, cv::COLOR_BGR2YUV_I420);
+    std::vector<uint8_t> nv12(static_cast<size_t>(w) * h * 3 / 2);
+    std::memcpy(nv12.data(), i420.data, static_cast<size_t>(w) * h);
+    const uint8_t* u  = i420.data + w * h;
+    const uint8_t* v  = u + w * h / 4;
+    uint8_t*       uv = nv12.data() + w * h;
+    for (int k = 0; k < w * h / 4; ++k) { uv[2*k] = u[k]; uv[2*k+1] = v[k]; }
+    return {std::move(nv12), {w, h}};
+}
 
 static void print_latency_table(
     const SectionTimer& t_pre,
@@ -32,8 +58,6 @@ static void print_latency_table(
     int runs,
     bool use_dmabuf)
 {
-    const double fps = 1000.0 / t_wall.avg();
-
     std::printf("\n+--------------------------------------------------------------------+\n");
     std::printf("| LATENCY BREAKDOWN  (%d runs, %s, double-buffered pipeline)\n",
                 runs, use_dmabuf ? "DMA-BUF input" : "host-mem input");
@@ -41,7 +65,6 @@ static void print_latency_table(
     std::printf("| %-16s | %8s | %8s | %8s | %8s |\n",
                 "Section", "avg ms", "min ms", "max ms", "p95 ms");
     std::printf("+------------------+----------+----------+----------+----------+\n");
-
     auto row = [](const SectionTimer& t) {
         std::printf("| %-16s | %8.3f | %8.3f | %8.3f | %8.3f |\n",
                     t.name.c_str(), t.avg(), t.min(), t.max(), t.p95());
@@ -50,9 +73,8 @@ static void print_latency_table(
     row(t_inf);
     row(t_dec);
     row(t_wall);
-
     std::printf("+------------------+----------+----------+----------+----------+\n");
-    std::printf("| Throughput (pipelined):  %.1f FPS\n", fps);
+    std::printf("| Throughput (pipelined):  %.1f FPS\n", 1000.0 / t_wall.avg());
     std::printf("| Sequential latency:      %.3f ms  (pre+inf+dec, non-overlapped)\n",
                 t_pre.avg() + t_inf.avg() + t_dec.avg());
     std::printf("+--------------------------------------------------------------------+\n\n");
@@ -60,27 +82,20 @@ static void print_latency_table(
 
 int main(int argc, char** argv)
 {
-    std::string model_path, image_path, labels_path;
-    int warmup = 5, bench = 20;
-    int nv12_w = 0, nv12_h = 0;
-    std::string out_path;
+    std::string model_path, image_path, labels_path, out_path;
+    int warmup = 5, bench = 20, nv12_w = 0, nv12_h = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string s(argv[i]);
-        if (s.ends_with(".json"))
-            model_path  = s;
-        else if (s.ends_with(".names") || s.ends_with(".txt"))
-            labels_path = s;
-        else if (s.starts_with("--warmup="))
-            warmup = std::stoi(s.substr(9));
-        else if (s.starts_with("--runs="))
-            bench  = std::stoi(s.substr(7));
+        if      (s.ends_with(".json"))                 model_path  = s;
+        else if (s.ends_with(".names") ||
+                 s.ends_with(".txt"))                  labels_path = s;
+        else if (s.starts_with("--warmup="))           warmup  = std::stoi(s.substr(9));
+        else if (s.starts_with("--runs="))             bench   = std::stoi(s.substr(7));
         else if (s.starts_with("--size="))
             std::sscanf(s.c_str() + 7, "%dx%d", &nv12_w, &nv12_h);
-        else if (s.starts_with("--output="))
-            out_path = s.substr(9);
-        else
-            image_path  = s;
+        else if (s.starts_with("--output="))           out_path = s.substr(9);
+        else                                           image_path  = s;
     }
 
     if (model_path.empty()) {
@@ -201,10 +216,11 @@ int main(int argc, char** argv)
     }
     std::printf("[INFO] Properties: %s\n", prop_str.c_str());
 
-    // ── Load input image into buf[0] ───────────────────────────────────────────
-    int8_t* in_ptr0 = in_ptrs[0];
+    // ── Load input image ───────────────────────────────────────────────────────
     cv::Mat vis_bgr;
     int orig_w = 0, orig_h = 0;
+    std::vector<uint8_t> bench_nv12;
+    cv::Size bench_sz;
     std::string out_jpg;
 
     if (!image_path.empty()) {
@@ -227,17 +243,13 @@ int main(int argc, char** argv)
             }
             f.read(reinterpret_cast<char*>(nv12.data()),
                    static_cast<std::streamsize>(frame_bytes));
-            std::printf("[INFO] NV12 input: %dx%d (%zu KB, first frame)\n",
+            std::printf("[INFO] NV12 input: %dx%d (%zu KB)\n",
                         sw, sh, frame_bytes / 1024);
 
             cv::Mat yuv(sh + sh / 2, sw, CV_8UC1, nv12.data());
             cv::cvtColor(yuv, vis_bgr, cv::COLOR_YUV2BGR_NV12);
             orig_w = sw; orig_h = sh;
-
-            nv12_to_tensor(nv12.data(), sw, sh, in_ptr0, in_info[0]);
-            out_jpg = out_path.empty()
-                ? image_path.substr(0, image_path.rfind('.')) + "_detections.jpg"
-                : out_path;
+            nv12_to_tensor(nv12.data(), sw, sh, in_ptrs[0], in_info[0]);
 
         } else {
             cv::Mat img = cv::imread(image_path);
@@ -245,103 +257,71 @@ int main(int argc, char** argv)
                 std::fprintf(stderr, "[ERROR] Cannot read: %s\n", image_path.c_str());
                 return 1;
             }
-            if (img.cols % 2 != 0 || img.rows % 2 != 0)
-                cv::resize(img, img,
-                    cv::Size(img.cols + img.cols % 2, img.rows + img.rows % 2));
             orig_w = img.cols; orig_h = img.rows;
             vis_bgr = img.clone();
-            std::printf("[INFO] Image %dx%d decoded and converted via NV12 pipeline\n",
-                        orig_w, orig_h);
+            std::printf("[INFO] Image %dx%d → NV12 pipeline\n", orig_w, orig_h);
 
-            cv::Mat i420;
-            cv::cvtColor(img, i420, cv::COLOR_BGR2YUV_I420);
-            std::vector<uint8_t> nv12(static_cast<size_t>(orig_w) * orig_h * 3 / 2);
-            std::memcpy(nv12.data(), i420.data,
-                        static_cast<size_t>(orig_w) * orig_h);
-            const uint8_t* u = i420.data + orig_w * orig_h;
-            const uint8_t* v = u + orig_w * orig_h / 4;
-            uint8_t* uv = nv12.data() + orig_w * orig_h;
-            for (int k = 0; k < orig_w * orig_h / 4; ++k) {
-                uv[2*k] = u[k]; uv[2*k+1] = v[k];
-            }
-            nv12_to_tensor(nv12.data(), orig_w, orig_h, in_ptr0, in_info[0]);
-            out_jpg = out_path.empty()
-                ? image_path.substr(0, image_path.rfind('.')) + "_detections.jpg"
-                : out_path;
+            auto [nv12, sz] = bgr_to_nv12(img);
+            nv12_to_tensor(nv12.data(), sz.width, sz.height, in_ptrs[0], in_info[0]);
         }
+        out_jpg = out_path.empty()
+            ? image_path.substr(0, image_path.rfind('.')) + "_detections.jpg"
+            : out_path;
+
     } else {
-        std::printf("[INFO] No image -- using synthetic NV12 640x640 test pattern\n");
+        std::printf("[INFO] No image — using synthetic NV12 640x640 test pattern\n");
         orig_w = 640; orig_h = 640;
         std::vector<uint8_t> nv12(640 * 640 * 3 / 2, 114);
-        nv12_to_tensor(nv12.data(), 640, 640, in_ptr0, in_info[0]);
+        nv12_to_tensor(nv12.data(), 640, 640, in_ptrs[0], in_info[0]);
         vis_bgr = cv::Mat(640, 640, CV_8UC3, cv::Scalar(114, 114, 114));
         out_jpg = out_path.empty() ? "synthetic_detections.jpg" : out_path;
+    }
+
+    // Build NV12 for the benchmark loop (re-encode from vis_bgr for a unified path).
+    {
+        auto [nv12, sz] = bgr_to_nv12(vis_bgr.empty()
+            ? cv::Mat(640, 640, CV_8UC3, cv::Scalar(114, 114, 114))
+            : vis_bgr);
+        bench_nv12 = std::move(nv12);
+        bench_sz   = sz;
     }
 
     // ── Warmup ─────────────────────────────────────────────────────────────────
     std::printf("[INFO] Warming up (%d runs)...\n", warmup);
     for (int i = 0; i < warmup; ++i)
-        axr_run_model_instance(instance,
-            in_args[0].data(), n_in, out_args.data(), n_out);
+        axr_run_model_instance(instance, in_args[0].data(), n_in, out_args.data(), n_out);
 
     // ── Double-buffer pipelined benchmark ─────────────────────────────────────
-    // Pattern per iteration i:
-    //   Thread: preprocess(nv12) -> buf[nxt]     (~2 ms, overlaps inference)
-    //   Main:   axr_run_model_instance(buf[cur]) (~6 ms, blocking)
-    //   Main:   future.get()  (thread already done since 2ms < 6ms)
-    //   Main:   decode + NMS                     (~0.1 ms)
-    //
-    // Steady-state frame time = max(preprocess, inference) ~= 6 ms -> ~160 FPS
-    std::printf("[INFO] Benchmarking (%d runs, pipelined preprocess+inference)...\n", bench);
+    // Per iteration: async thread preprocesses buf[nxt] (~2 ms) while AIPU
+    // runs buf[cur] (~6 ms).  Preprocess hides behind inference.
+    std::printf("[INFO] Benchmarking (%d runs, pipelined)...\n", bench);
 
-    SectionTimer t_pre{"Preprocess NV12"};
-    SectionTimer t_inf{"Inference (AIPU)"};
-    SectionTimer t_dec{"Decode + NMS"};
+    SectionTimer t_pre {"Preprocess NV12"};
+    SectionTimer t_inf {"Inference (AIPU)"};
+    SectionTimer t_dec {"Decode + NMS"};
     SectionTimer t_wall{"Frame wall time"};
 
-    std::vector<uint8_t> nv12_bench;
-    int bench_w = orig_w, bench_h = orig_h;
-    {
-        cv::Mat src = vis_bgr.empty()
-            ? cv::Mat(640, 640, CV_8UC3, cv::Scalar(114,114,114))
-            : vis_bgr;
-        if (src.cols % 2 != 0 || src.rows % 2 != 0)
-            cv::resize(src, src, cv::Size(src.cols + src.cols%2, src.rows + src.rows%2));
-        bench_w = src.cols; bench_h = src.rows;
-        cv::Mat i420;
-        cv::cvtColor(src, i420, cv::COLOR_BGR2YUV_I420);
-        nv12_bench.resize(static_cast<size_t>(bench_w) * bench_h * 3 / 2);
-        std::memcpy(nv12_bench.data(), i420.data,
-                    static_cast<size_t>(bench_w) * bench_h);
-        const uint8_t* u = i420.data + bench_w * bench_h;
-        const uint8_t* v = u + bench_w * bench_h / 4;
-        uint8_t* uv = nv12_bench.data() + bench_w * bench_h;
-        for (int k = 0; k < bench_w * bench_h / 4; ++k) {
-            uv[2*k] = u[k]; uv[2*k+1] = v[k];
-        }
-    }
-
-    // Prime buf[0] before the loop so iteration 0 can launch preprocess into buf[1]
-    nv12_to_tensor(nv12_bench.data(), bench_w, bench_h, in_ptrs[0], in_info[0]);
+    nv12_to_tensor(bench_nv12.data(), bench_sz.width, bench_sz.height,
+                   in_ptrs[0], in_info[0]);
 
     for (int i = 0; i < bench; ++i) {
         const int cur = i & 1;
         const int nxt = cur ^ 1;
-
         const auto iter_t0 = Clock::now();
 
-        // Launch preprocess of next frame on a background thread
-        const uint8_t*       src_data = nv12_bench.data();
-        int8_t*              nxt_ptr  = in_ptrs[nxt];
-        const axrTensorInfo& tinfo    = in_info[0];
+        const uint8_t*       src   = bench_nv12.data();
+        const int            bw    = bench_sz.width;
+        const int            bh    = bench_sz.height;
+        int8_t*              nxtbuf = in_ptrs[nxt];
+        const axrTensorInfo& tinfo = in_info[0];
+
         auto pre_fut = std::async(std::launch::async,
-            [src_data, bench_w, bench_h, nxt_ptr, &tinfo]() -> double {
+            [src, bw, bh, nxtbuf, &tinfo]() -> double {
                 const auto t0 = Clock::now();
-                nv12_to_tensor(src_data, bench_w, bench_h, nxt_ptr, tinfo);
+                nv12_to_tensor(src, bw, bh, nxtbuf, tinfo);
                 return Ms(Clock::now() - t0).count();
             });
 
-        // Run inference on buf[cur] -- overlaps with preprocess thread
         {
             ScopeTimer st(t_inf);
             if (axr_run_model_instance(instance,
@@ -351,17 +331,10 @@ int main(int argc, char** argv)
                 return 1;
             }
         }
+        t_pre.record(pre_fut.get());
 
-        t_pre.record(pre_fut.get());  // get() waits and returns thread duration
-
-        // Decode + NMS
         {
             ScopeTimer st(t_dec);
-            auto grid_to_sid = [](size_t h) -> int {
-                if (h >= 70) return 0;
-                if (h >= 35) return 1;
-                return 2;
-            };
             std::vector<Det> tmp;
             for (size_t j = 0; j < n_out; ++j)
                 decode_head(out_host[j].get(), out_info[j],
@@ -375,14 +348,10 @@ int main(int argc, char** argv)
     print_latency_table(t_pre, t_inf, t_dec, t_wall, bench, use_dmabuf);
 
     // ── Final inference for annotation ─────────────────────────────────────────
-    nv12_to_tensor(nv12_bench.data(), bench_w, bench_h, in_ptrs[0], in_info[0]);
+    nv12_to_tensor(bench_nv12.data(), bench_sz.width, bench_sz.height,
+                   in_ptrs[0], in_info[0]);
     axr_run_model_instance(instance, in_args[0].data(), n_in, out_args.data(), n_out);
 
-    auto grid_to_sid = [](size_t h) -> int {
-        if (h >= 70) return 0;
-        if (h >= 35) return 1;
-        return 2;
-    };
     std::vector<Det> all_dets;
     for (size_t i = 0; i < n_out; ++i)
         decode_head(out_host[i].get(), out_info[i],
